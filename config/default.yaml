@@ -1,0 +1,35 @@
+# Databricks Cost Optimizer Configuration
+
+# Date range for analysis (can be overridden by ENV vars)
+date_range:
+  start_date: "2024-01-01"
+  end_date: "2024-01-31"
+
+# Analysis thresholds
+thresholds:
+  # Idle threshold in minutes before cluster is considered idle
+  idle_threshold_minutes: 30
+  
+  # Query warning if > N seconds
+  long_query_threshold_seconds: 3600
+  
+  # Cluster uptime threshold for "always-on" detection
+  always_on_threshold_percent: 80
+  
+  # Join count warning
+  excessive_joins_threshold: 5
+
+# Recommendations confidence factor (0.0 - 1.0)
+# Higher = more conservative savings estimates
+confidence_factor: 0.75
+
+# Report settings
+reporting:
+  include_json: true
+  include_markdown: true
+  timezone: UTC
+
+# Mock data settings (for testing without Databricks access)
+mock:
+  enabled: false
+  seed: 42

@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  databricks-cost-optimizer:
+    build: .
+    image: databricks-cost-optimizer:latest
+    container_name: databricks-cost-optimizer
+    env_file:
+      - .env
+    volumes:
+      - ./output:/output
+    environment:
+      - OUTPUT_DIR=/output
+    # Run once and exit
+    restart: "no"
