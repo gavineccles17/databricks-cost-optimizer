@@ -1,9 +1,13 @@
 """Analyzes cluster efficiency and configuration."""
 
 import logging
+import re
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+# Pattern to detect job-run clusters (ephemeral clusters created for job runs)
+JOB_RUN_CLUSTER_PATTERN = re.compile(r'^job-\d+-run-\d+', re.IGNORECASE)
 
 
 class ClusterAnalyzer:
@@ -52,6 +56,12 @@ class ClusterAnalyzer:
         for cluster in clusters:
             cluster_id = cluster.get("cluster_id", "unknown")
             cluster_name = cluster.get("cluster_name", cluster_id)
+            
+            # Skip job-run clusters - these are ephemeral and managed by jobs
+            # They should be analyzed at the job level, not cluster level
+            if JOB_RUN_CLUSTER_PATTERN.match(cluster_name or ""):
+                continue
+            
             cost_info = cost_by_cluster.get(cluster_id, {})
             cluster_cost = cost_info.get("total_cost", 0)
             

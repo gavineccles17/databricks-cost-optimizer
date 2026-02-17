@@ -78,12 +78,19 @@ class RecommendationEngine:
                 seen_ids.add(rec["id"])
                 unique_recs.append(rec)
         
+        # Filter out recommendations with zero or negligible savings (< $1/month)
+        min_savings_threshold = 1.0
+        filtered_recs = [
+            rec for rec in unique_recs 
+            if rec.get("estimated_savings", 0) >= min_savings_threshold
+        ]
+        
         # Sort: high severity first, then by savings
         severity_order = {"high": 0, "medium": 1, "low": 2}
-        unique_recs.sort(key=lambda x: (severity_order.get(x.get("severity", "low"), 3), -x.get("estimated_savings", 0)))
+        filtered_recs.sort(key=lambda x: (severity_order.get(x.get("severity", "low"), 3), -x.get("estimated_savings", 0)))
         
-        logger.info(f"Generated {len(unique_recs)} recommendations")
-        return unique_recs
+        logger.info(f"Generated {len(filtered_recs)} recommendations (filtered {len(unique_recs) - len(filtered_recs)} with <${min_savings_threshold} savings)")
+        return filtered_recs
 
     # ================== HIGH PRIORITY: INFRASTRUCTURE QUICK WINS ==================
     

@@ -54,7 +54,7 @@ MOCK_MODE=false
 docker build -t databricks-cost-optimizer .
 
 # Run the analysis
-docker run --env-file .env -v $(PWD)/output:/output databricks-cost-optimizer
+docker run --rm --env-file .env -v "$(pwd)/output:/output" databricks-cost-optimizer:latest
 
 # View your reports
 cat output/optimization_report.md

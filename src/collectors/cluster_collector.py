@@ -62,6 +62,7 @@ class ClusterCollector:
             logger.warning(f"Could not fetch cluster data: {str(e)}")
         
         # Get cluster cost attribution from billing
+        # Exclude job-run clusters (job-xxxxx-run-yyyy) as those are aggregated at job level
         cluster_costs_query = f"""
         SELECT
             u.usage_metadata.cluster_id as cluster_id,
@@ -80,6 +81,7 @@ class ClusterCollector:
             AND u.usage_end_time >= lp.price_start_time
             AND (lp.price_end_time IS NULL OR u.usage_end_time < lp.price_end_time)
             AND u.usage_date BETWEEN '{start_date.date()}' AND '{end_date.date()}'
+            AND (c.cluster_name IS NULL OR c.cluster_name NOT RLIKE '^job-[0-9]+-run-[0-9]+')
         GROUP BY 1, 2, 3
         ORDER BY total_cost DESC
         LIMIT 50
