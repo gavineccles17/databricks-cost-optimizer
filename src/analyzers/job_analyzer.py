@@ -20,10 +20,10 @@ class JobAnalyzer:
         usage_data: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        Analyze job execution patterns.
+        Analyze job execution patterns and costs.
         
         Args:
-            jobs_data: Data from job collector
+            jobs_data: Data from job collector (with cost attribution)
             usage_data: Data from usage collector
         
         Returns:
@@ -32,41 +32,41 @@ class JobAnalyzer:
         logger.info("Analyzing jobs...")
         
         jobs = jobs_data.get("jobs", [])
-        runs = jobs_data.get("runs", [])
         
-        # Analyze run patterns
-        long_running_jobs = []
-        failed_runs = []
+        # Analyze job cost patterns
+        high_cost_jobs = []
+        serverless_candidates = []
         
-        for run in runs:
-            job_id = run.get("job_id")
-            start_time = run.get("start_time")
-            end_time = run.get("end_time")
-            state = run.get("state", "").upper()
+        for job in jobs:
+            job_id = job.get("job_id")
+            job_name = job.get("job_name") or job_id
+            total_cost = job.get("total_cost", 0)
+            total_dbus = job.get("total_dbus", 0)
+            run_count = job.get("run_count", 0)
+            is_serverless = job.get("is_serverless")
             
-            # Check for long-running jobs
-            if start_time and end_time:
-                duration_ms = end_time - start_time
-                duration_seconds = duration_ms / 1000
-                
-                if duration_seconds > self.long_query_threshold:
-                    long_running_jobs.append({
-                        "job_id": job_id,
-                        "duration_seconds": duration_seconds,
-                        "severity": "medium",
-                    })
-            
-            # Check for failed runs
-            if state == "FAILED":
-                failed_runs.append({
+            # Flag high-cost jobs
+            if total_cost > 10:  # More than $10 in the period
+                high_cost_jobs.append({
                     "job_id": job_id,
-                    "state": state,
-                    "message": run.get("state_message"),
+                    "job_name": job_name,
+                    "total_cost": total_cost,
+                    "total_dbus": total_dbus,
+                    "run_count": run_count,
+                })
+            
+            # Identify serverless candidates (non-serverless jobs with many runs)
+            if not is_serverless and run_count and run_count > 10:
+                serverless_candidates.append({
+                    "job_id": job_id,
+                    "job_name": job_name,
+                    "run_count": run_count,
+                    "total_cost": total_cost,
                 })
         
         return {
             "job_count": len(jobs),
-            "run_count": len(runs),
-            "long_running_jobs": long_running_jobs,
-            "failed_runs": failed_runs,
+            "jobs": jobs,
+            "high_cost_jobs": high_cost_jobs,
+            "serverless_candidates": serverless_candidates,
         }

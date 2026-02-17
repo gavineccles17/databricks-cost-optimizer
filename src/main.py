@@ -17,6 +17,7 @@ from src.collectors import (
     ClusterCollector,
     JobCollector,
     QueryCollector,
+    WarehouseCollector,
 )
 from src.analyzers import (
     CostAnalyzer,
@@ -34,6 +35,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Suppress noisy Databricks SQL connector logs
+logging.getLogger("databricks.sql").setLevel(logging.WARNING)
 
 app = typer.Typer()
 
@@ -89,6 +93,10 @@ def main(
         cluster_collector = ClusterCollector(db_client, config)
         clusters_data = cluster_collector.collect(start_date, end_date)
         
+        logger.info("Collecting warehouse data...")
+        warehouse_collector = WarehouseCollector(db_client, config)
+        warehouses_data = warehouse_collector.collect(start_date, end_date)
+        
         logger.info("Collecting job data...")
         job_collector = JobCollector(db_client, config)
         jobs_data = job_collector.collect(start_date, end_date)
@@ -100,7 +108,7 @@ def main(
         # ============ ANALYZERS ============
         logger.info("Performing cost analysis...")
         cost_analyzer = CostAnalyzer(config)
-        cost_analysis = cost_analyzer.analyze(usage_data, clusters_data, jobs_data)
+        cost_analysis = cost_analyzer.analyze(usage_data, clusters_data, jobs_data, warehouses_data)
         
         logger.info("Analyzing cluster efficiency...")
         cluster_analyzer = ClusterAnalyzer(config)
@@ -118,7 +126,7 @@ def main(
         logger.info("Generating recommendations...")
         rec_engine = RecommendationEngine(config)
         recommendations = rec_engine.generate(
-            cost_analysis, cluster_analysis, job_analysis, sql_analysis
+            cost_analysis, cluster_analysis, job_analysis, sql_analysis, warehouses_data
         )
         
         # ============ REPORTING ============
@@ -134,6 +142,8 @@ def main(
             job_analysis,
             sql_analysis,
             recommendations,
+            warehouses_data,
+            queries_data,
         )
         logger.info(f"Markdown report generated: {md_path}")
         

@@ -1,4 +1,4 @@
-databricks-sql-connector[pyarrow]==1.0.1
+databricks-sql-connector[pyarrow]>=3.0.0
 python-dotenv==1.0.0
 pyyaml==6.0.1
 requests==2.31.0
@@ -7,3 +7,4 @@ jinja2==3.1.2
 typer==0.9.0
 pytest==7.4.3
 pytest-asyncio==0.21.1
+thrift==0.20.0

@@ -133,24 +133,113 @@ class DatabricksClient:
         Returns:
             Mock data matching the query
         """
-        # Return empty list or minimal synthetic data based on query
-        if "system.billing.usage" in query:
+        query_lower = query.lower()
+        
+        # Billing queries with pricing join - match the query output columns
+        if "system.billing.usage" in query_lower and ("account_prices" in query_lower or "list_prices" in query_lower):
             return [
-                {"dbu_type": "COMPUTE", "workspace_id": 123456, "usage_quantity": 100.0},
-                {"dbu_type": "SQL", "workspace_id": 123456, "usage_quantity": 50.0},
+                {
+                    "usage_date": "2025-12-01",
+                    "sku_name": "PREMIUM_ALL_PURPOSE_DBU",
+                    "billing_origin_product": "ALL_PURPOSE",
+                    "workspace_id": 123456,
+                    "usage_quantity": 50.0,
+                    "usage_unit": "DBU",
+                    "cluster_id": "cluster-1",
+                    "job_id": None,
+                    "warehouse_id": None,
+                    "pipeline_id": None,
+                    "endpoint_name": None,
+                    "run_as_user": "user@example.com",
+                    "is_serverless": False,
+                    "is_photon": True,
+                    "dollar_cost": 25.50,
+                },
+                {
+                    "usage_date": "2025-12-01",
+                    "sku_name": "PREMIUM_SQL_SERVER_DBU",
+                    "billing_origin_product": "SQL",
+                    "workspace_id": 123456,
+                    "usage_quantity": 30.0,
+                    "usage_unit": "DBU",
+                    "cluster_id": None,
+                    "job_id": None,
+                    "warehouse_id": "wh-1",
+                    "pipeline_id": None,
+                    "endpoint_name": None,
+                    "run_as_user": "analyst@example.com",
+                    "is_serverless": True,
+                    "is_photon": False,
+                    "dollar_cost": 18.00,
+                },
+                {
+                    "usage_date": "2025-12-02",
+                    "sku_name": "PREMIUM_JOBS_DBU",
+                    "billing_origin_product": "JOBS",
+                    "workspace_id": 123456,
+                    "usage_quantity": 20.0,
+                    "usage_unit": "DBU",
+                    "cluster_id": "cluster-2",
+                    "job_id": "job-1",
+                    "warehouse_id": None,
+                    "pipeline_id": None,
+                    "endpoint_name": None,
+                    "run_as_user": "etl@example.com",
+                    "is_serverless": False,
+                    "is_photon": False,
+                    "dollar_cost": 8.00,
+                },
             ]
-        elif "system.compute.clusters" in query:
+        elif "system.billing.account_prices" in query_lower:
+            return [{"cnt": 1}]  # Account prices exist
+        elif "system.compute.warehouses" in query_lower:
+            return [
+                {
+                    "warehouse_id": "wh-1",
+                    "name": "SQL Warehouse",
+                    "size": "Small",
+                    "cluster_size": "Small",
+                    "warehouse_type": "PRO",
+                    "auto_stop_mins": 10,
+                    "state": "RUNNING",
+                    "creator_name": "admin@example.com",
+                },
+                {
+                    "warehouse_id": "wh-2", 
+                    "name": "Analytics Warehouse",
+                    "size": "Medium",
+                    "cluster_size": "Medium",
+                    "warehouse_type": "CLASSIC",
+                    "auto_stop_mins": 0,  # No auto-stop - issue
+                    "state": "STOPPED",
+                    "creator_name": "admin@example.com",
+                },
+            ]
+        elif "system.compute.warehouse_events" in query_lower:
+            return []
+        elif "system.compute.clusters" in query_lower:
             return [
                 {"cluster_id": "cluster-1", "cluster_name": "prod-cluster", "num_workers": 4},
                 {"cluster_id": "cluster-2", "cluster_name": "dev-cluster", "num_workers": 2},
             ]
-        elif "system.jobs.jobs" in query:
+        elif "system.lakeflow.jobs" in query_lower or "system.jobs.jobs" in query_lower:
             return [
-                {"job_id": 1, "settings": {"name": "daily-job"}, "created_time": 1234567890},
+                {"job_id": "job-1", "name": "daily-job", "created_time": 1234567890},
             ]
-        elif "system.query.history" in query:
+        elif "system.query.history" in query_lower:
             return [
-                {"query_id": "q1", "query_text": "SELECT 1", "duration_ms": 100},
+                {
+                    "user_name": "analyst@example.com",
+                    "query_count": 25,
+                    "avg_duration_seconds": 12.5,
+                    "total_bytes_read": 500000000,
+                },
+                {
+                    "user_name": "etl@example.com",
+                    "query_count": 10,
+                    "avg_duration_seconds": 45.0,
+                    "total_bytes_read": 2000000000,
+                },
             ]
         
         return []

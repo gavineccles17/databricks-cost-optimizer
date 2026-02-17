@@ -33,38 +33,104 @@ class ClusterAnalyzer:
         logger.info("Analyzing clusters...")
         
         clusters = clusters_data.get("clusters", [])
+        cluster_costs = clusters_data.get("cluster_costs", [])
+        
+        # Build cost lookup
+        cost_by_cluster = {}
+        for cc in cluster_costs:
+            cid = cc.get("cluster_id")
+            if cid:
+                cost_by_cluster[cid] = {
+                    "total_cost": float(cc.get("total_cost", 0) or 0),
+                    "total_dbus": float(cc.get("total_dbus", 0) or 0),
+                    "cluster_name": cc.get("cluster_name"),
+                    "owner": cc.get("owner"),
+                }
         
         issues = []
         
         for cluster in clusters:
             cluster_id = cluster.get("cluster_id", "unknown")
             cluster_name = cluster.get("cluster_name", cluster_id)
+            cost_info = cost_by_cluster.get(cluster_id, {})
+            cluster_cost = cost_info.get("total_cost", 0)
             
             # Check for missing auto-termination
-            autotermination_min = cluster.get("autotermination_minutes")
-            if autotermination_min is None or autotermination_min == 0:
-                issues.append({
-                    "type": "no_autotermination",
-                    "cluster_id": cluster_id,
-                    "cluster_name": cluster_name,
-                    "severity": "high",
-                    "description": "Cluster has no auto-termination configured",
-                })
+            auto_termination_minutes = cluster.get("auto_termination_minutes")
+            if auto_termination_minutes is not None:
+                if auto_termination_minutes == 0 or str(auto_termination_minutes) == "0":
+                    issues.append({
+                        "type": "no_autotermination",
+                        "cluster_id": cluster_id,
+                        "cluster_name": cluster_name,
+                        "severity": "high",
+                        "description": "Cluster has no auto-termination configured - will run indefinitely",
+                        "cost": cluster_cost,
+                    })
             
-            # Check for high worker count (potentially over-provisioned)
-            num_workers = cluster.get("num_workers", 0)
-            if num_workers > 8:
+            # Check for no autoscaling (fixed worker count)
+            worker_count = cluster.get("worker_count")
+            min_autoscale = cluster.get("min_autoscale_workers")
+            max_autoscale = cluster.get("max_autoscale_workers")
+            
+            if worker_count and not min_autoscale and not max_autoscale:
                 issues.append({
-                    "type": "over_provisioned",
+                    "type": "no_autoscaling",
                     "cluster_id": cluster_id,
                     "cluster_name": cluster_name,
                     "severity": "medium",
-                    "description": f"Cluster has {num_workers} workers (consider right-sizing)",
-                    "current_workers": num_workers,
+                    "description": f"Fixed-size cluster with {worker_count} workers - autoscaling would reduce costs during low usage",
+                    "cost": cluster_cost,
+                    "worker_count": worker_count,
                 })
+            
+            # Check for oversized clusters
+            workers = worker_count or max_autoscale or 0
+            if workers:
+                workers = int(workers)
+                if workers >= 20:
+                    issues.append({
+                        "type": "oversized",
+                        "cluster_id": cluster_id,
+                        "cluster_name": cluster_name,
+                        "severity": "high",
+                        "description": f"Large cluster with {workers} workers - verify this capacity is utilized",
+                        "cost": cluster_cost,
+                        "worker_count": workers,
+                    })
+                elif workers >= 10:
+                    issues.append({
+                        "type": "oversized",
+                        "cluster_id": cluster_id,
+                        "cluster_name": cluster_name,
+                        "severity": "medium",
+                        "description": f"Cluster configured with {workers} workers - review utilization",
+                        "cost": cluster_cost,
+                        "worker_count": workers,
+                    })
+            
+            # Check autoscaling configuration (min too high)
+            if min_autoscale and int(min_autoscale) > 2:
+                issues.append({
+                    "type": "high_min_workers",
+                    "cluster_id": cluster_id,
+                    "cluster_name": cluster_name,
+                    "severity": "low",
+                    "description": f"Autoscaling min_workers={min_autoscale} - consider min=1 to save during idle",
+                    "cost": cluster_cost,
+                    "min_workers": min_autoscale,
+                })
+        
+        # Check for clusters with costs but no config (may be deleted or serverless)
+        for cluster_id, cost_info in cost_by_cluster.items():
+            if cluster_id not in [c.get("cluster_id") for c in clusters]:
+                # This cluster has costs but no config - might be serverless job cluster
+                if cost_info.get("total_cost", 0) > 0:
+                    logger.debug(f"Cluster {cluster_id} has costs but no config - likely job/serverless cluster")
         
         return {
             "cluster_count": len(clusters),
+            "cluster_costs": cluster_costs,
             "issues": issues,
             "issue_count": len(issues),
         }
