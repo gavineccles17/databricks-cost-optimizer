@@ -414,7 +414,7 @@ class MarkdownReport:
             "",
             "| Month | Current Path | Optimized Path | Cumulative Savings |",
             "|-------|--------------|----------------|-------------------|",
-        ]
+        ])
         
         for month in range(1, 13):
             current = monthly_cost * month
