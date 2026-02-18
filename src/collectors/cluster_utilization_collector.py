@@ -4,8 +4,17 @@ Cluster Utilization Collector - CPU/Memory pressure analysis using system.comput
 Based on KPI framework from: https://medium.com/@mzeoli.it/we-built-kpis-to-right-size-databricks-job-clusters-heres-how
 
 Key data sources:
-- system.compute.node_timeline: Per-node CPU and memory utilization over time
+- system.compute.node_timeline: Per-node CPU, memory, I/O wait, and swap metrics
 - system.billing.usage: DBU consumption (cost proxy)
+
+Key analyses:
+- CPU/Memory rightsizing (percentile-based)
+- I/O bottleneck detection (using cpu_wait_percent)
+- Memory spike detection (volatility analysis)
+- Swap usage detection (critical performance issue)
+- Idle cluster detection
+- Driver/worker imbalance detection
+- Autoscale effectiveness analysis
 """
 
 import logging
@@ -35,6 +44,21 @@ class ClusterUtilizationCollector:
         "cpu_very_hot_pct": 90.0,    # CPU "very hot" threshold
         "mem_hot_pct": 90.0,         # Memory "hot" threshold
         "mem_very_hot_pct": 95.0,    # Memory "very hot" threshold (OOM risk)
+        
+        # I/O wait thresholds (disk/network bottleneck detection)
+        "io_wait_p90_moderate": 0.15,  # P90 I/O wait >= 15% = moderate bottleneck
+        "io_wait_p90_severe": 0.25,    # P90 I/O wait >= 25% = severe bottleneck
+        "io_wait_time_threshold": 0.20, # >20% time with I/O wait >20% = I/O bound
+        
+        # Memory volatility thresholds (spike detection)
+        "mem_stddev_moderate": 0.15,   # Stddev >= 15% = moderate volatility
+        "mem_stddev_high": 0.25,       # Stddev >= 25% = high volatility
+        "mem_volatility_moderate": 0.35, # P99-P50 gap >= 35% = moderate spikes
+        "mem_volatility_high": 0.50,   # P99-P50 gap >= 50% = high spikes
+        
+        # Swap thresholds (critical performance issue)
+        "swap_max_threshold": 0.01,    # Any swap usage >1% is concerning
+        "swap_time_threshold": 0.05,   # Swapping >5% of time is critical
     }
     
     def __init__(self, client, config: Dict[str, Any]):
@@ -117,6 +141,11 @@ class ClusterUtilizationCollector:
         query = f"""
         WITH target_clusters AS (
             -- Identify top {top_n} highest-DBU clusters (excluding serverless)
+            -- FILTER 1: LIMIT {top_n} - Performance optimization. Only analyze the top N most expensive clusters
+            --           to avoid scanning the entire node_timeline table (which can be 100GB+).
+            --           Top 20-50 clusters typically represent 70-90% of total compute cost.
+            -- FILTER 2: HAVING > 10 DBUs - Ignore trivial/test clusters that consumed <10 DBUs during the
+            --           entire analysis period. At $0.10-0.50/DBU, this filters clusters costing <$1-5.
             SELECT 
                 usage_metadata.cluster_id as cluster_id,
                 ROUND(SUM(usage_quantity), 3) AS total_dbus,
@@ -126,9 +155,9 @@ class ClusterUtilizationCollector:
                 AND usage_metadata.cluster_id IS NOT NULL
                 AND (product_features.is_serverless = false OR product_features.is_serverless IS NULL)
             GROUP BY usage_metadata.cluster_id
-            HAVING SUM(usage_quantity) > 10  -- Minimum threshold
+            HAVING SUM(usage_quantity) > 10  -- Filter out negligible test/dev clusters
             ORDER BY total_dbus DESC
-            LIMIT {top_n}
+            LIMIT {top_n}  -- Focus on highest-cost clusters for maximum ROI
         ),
         
         cluster_info AS (
@@ -139,19 +168,35 @@ class ClusterUtilizationCollector:
                 c.driver_node_type,
                 c.worker_node_type,
                 c.min_autoscale_workers,
-                c.max_autoscale_workers
+                c.max_autoscale_workers,
+                c.cluster_source,
+                -- Extract availability from nested cloud provider attributes
+                COALESCE(
+                    c.aws_attributes.availability,
+                    c.azure_attributes.availability, 
+                    c.gcp_attributes.availability
+                ) as availability,
+                -- Determine if using spot/preemptible instances
+                CASE 
+                    WHEN c.aws_attributes.availability IN ('SPOT', 'SPOT_WITH_FALLBACK') THEN true
+                    WHEN c.azure_attributes.availability IN ('SPOT_AZURE', 'SPOT_WITH_FALLBACK_AZURE') THEN true
+                    WHEN c.gcp_attributes.availability IN ('PREEMPTIBLE_GCP', 'PREEMPTIBLE_WITH_FALLBACK_GCP') THEN true
+                    ELSE false
+                END as uses_spot_instances
             FROM system.compute.clusters c
             JOIN target_clusters tc ON c.cluster_id = tc.cluster_id
             QUALIFY ROW_NUMBER() OVER (PARTITION BY c.cluster_id ORDER BY c.change_time DESC) = 1
         ),
         
         timeline_data AS (
-            -- Get raw per-node CPU and memory metrics
+            -- Get raw per-node CPU, memory, and I/O metrics
             SELECT
                 nt.cluster_id,
                 CASE WHEN nt.driver THEN 'driver' ELSE 'worker' END AS component,
                 (COALESCE(nt.cpu_system_percent, 0) + COALESCE(nt.cpu_user_percent, 0) + COALESCE(nt.cpu_wait_percent, 0)) AS cpu_total_pct,
-                COALESCE(nt.mem_used_percent, 0) AS mem_pct
+                COALESCE(nt.cpu_wait_percent, 0) AS cpu_wait_pct,  -- I/O wait time
+                COALESCE(nt.mem_used_percent, 0) AS mem_pct,
+                COALESCE(nt.mem_swap_percent, 0) AS swap_pct
             FROM system.compute.node_timeline nt
             JOIN target_clusters tc ON nt.cluster_id = tc.cluster_id
             WHERE nt.start_time >= '{start_date}'
@@ -179,6 +224,18 @@ class ClusterUtilizationCollector:
                 ROUND(PERCENTILE(t.mem_pct, 0.99) / 100.0, 4) AS mem_p99,
                 ROUND(MAX(t.mem_pct) / 100.0, 4) AS mem_max,
                 
+                -- Memory volatility (spike detection)
+                ROUND(STDDEV(t.mem_pct) / 100.0, 4) AS mem_stddev,
+                
+                -- I/O wait metrics (disk/network bottleneck detection)
+                ROUND(PERCENTILE(t.cpu_wait_pct, 0.50) / 100.0, 4) AS io_wait_p50,
+                ROUND(PERCENTILE(t.cpu_wait_pct, 0.90) / 100.0, 4) AS io_wait_p90,
+                ROUND(AVG(CASE WHEN t.cpu_wait_pct >= 20 THEN 1.0 ELSE 0.0 END), 4) AS io_wait_time_above_20pct,
+                
+                -- Swap usage (critical performance issue)
+                ROUND(MAX(t.swap_pct) / 100.0, 4) AS swap_max,
+                ROUND(AVG(CASE WHEN t.swap_pct > 0 THEN 1.0 ELSE 0.0 END), 4) AS swap_time_fraction,
+                
                 -- Time above thresholds (fraction)
                 ROUND(AVG(CASE WHEN t.cpu_total_pct >= {cpu_hot} THEN 1.0 ELSE 0.0 END), 4) AS cpu_time_above_80pct,
                 ROUND(AVG(CASE WHEN t.cpu_total_pct >= {cpu_very_hot} THEN 1.0 ELSE 0.0 END), 4) AS cpu_time_above_90pct,
@@ -188,7 +245,11 @@ class ClusterUtilizationCollector:
                 COUNT(*) AS sample_count
             FROM timeline_data t
             GROUP BY t.cluster_id, t.component
-            HAVING COUNT(*) >= 10  -- Minimum samples for reliability
+            -- FILTER 3: HAVING >= 10 samples - Statistical reliability threshold. Need at least 10 data points
+            --           from node_timeline to calculate meaningful percentiles (P50, P90, P95).
+            --           Each sample = ~1 minute, so this requires ~10 minutes of runtime data minimum.
+            --           Prevents misleading recommendations from ephemeral/short-lived clusters.
+            HAVING COUNT(*) >= 10
         )
         
         SELECT
@@ -200,9 +261,15 @@ class ClusterUtilizationCollector:
             CASE WHEN a.component = 'driver' THEN ci.driver_node_type ELSE ci.worker_node_type END AS node_type,
             ci.min_autoscale_workers,
             ci.max_autoscale_workers,
+            ci.cluster_source,
+            ci.availability,
+            ci.uses_spot_instances,
             
             a.cpu_p25, a.cpu_p50, a.cpu_p75, a.cpu_p90, a.cpu_p99,
             a.mem_p25, a.mem_p50, a.mem_p75, a.mem_p90, a.mem_p95, a.mem_p99, a.mem_max,
+            a.mem_stddev,
+            a.io_wait_p50, a.io_wait_p90, a.io_wait_time_above_20pct,
+            a.swap_max, a.swap_time_fraction,
             a.cpu_time_above_80pct, a.cpu_time_above_90pct,
             a.mem_time_above_90pct, a.mem_time_above_95pct,
             a.sample_count
@@ -230,8 +297,15 @@ class ClusterUtilizationCollector:
             cpu_p90 = float(row.get("cpu_p90") or 0)
             mem_p50 = float(row.get("mem_p50") or 0)
             mem_p95 = float(row.get("mem_p95") or 0)
+            mem_p99 = float(row.get("mem_p99") or 0)
+            mem_stddev = float(row.get("mem_stddev") or 0)
             cpu_time_80 = float(row.get("cpu_time_above_80pct") or 0)
             mem_time_90 = float(row.get("mem_time_above_90pct") or 0)
+            io_wait_p50 = float(row.get("io_wait_p50") or 0)
+            io_wait_p90 = float(row.get("io_wait_p90") or 0)
+            io_wait_time_20 = float(row.get("io_wait_time_above_20pct") or 0)
+            swap_max = float(row.get("swap_max") or 0)
+            swap_time = float(row.get("swap_time_fraction") or 0)
             
             # Determine CPU status
             cpu_hot = (cpu_p90 >= self.thresholds["cpu_p90_high"] or 
@@ -267,6 +341,34 @@ class ClusterUtilizationCollector:
             else:
                 overall_status = "right-sized"
             
+            # I/O wait analysis - Detect disk/network bottlenecks
+            io_bound = False
+            io_issue = None
+            if (io_wait_p90 >= self.thresholds["io_wait_p90_moderate"] or 
+                io_wait_time_20 >= self.thresholds["io_wait_time_threshold"]):
+                io_bound = True
+                if io_wait_p90 >= self.thresholds["io_wait_p90_severe"]:
+                    io_issue = "severe_io_bottleneck"
+                else:
+                    io_issue = "moderate_io_bottleneck"
+            
+            # Memory spike detection - High volatility = unpredictable memory usage
+            mem_volatility = mem_p99 - mem_p50
+            mem_spike_risk = "none"
+            if (mem_stddev >= self.thresholds["mem_stddev_moderate"] or 
+                mem_volatility >= self.thresholds["mem_volatility_moderate"]):
+                if (mem_stddev >= self.thresholds["mem_stddev_high"] or 
+                    mem_volatility >= self.thresholds["mem_volatility_high"]):
+                    mem_spike_risk = "high"
+                else:
+                    mem_spike_risk = "moderate"
+            
+            # Swap detection - Critical performance issue
+            swap_issue = False
+            if (swap_max >= self.thresholds["swap_max_threshold"] or 
+                swap_time >= self.thresholds["swap_time_threshold"]):
+                swap_issue = True
+            
             # Suggested action
             if mem_hot and cpu_hot:
                 suggested_action = "Increase memory first; reassess CPU"
@@ -282,6 +384,30 @@ class ClusterUtilizationCollector:
                 suggested_action = "Consider reducing CPU (fewer/smaller nodes)"
             else:
                 suggested_action = "Keep current configuration"
+            
+            # Add critical issues first
+            if swap_issue:
+                suggested_action = f"CRITICAL: Memory swapping detected! {suggested_action}"
+            
+            # Add I/O bottleneck recommendations
+            if io_bound:
+                if io_issue == "severe_io_bottleneck":
+                    suggested_action += " | SEVERE I/O BOTTLENECK: Consider storage-optimized instances, Photon acceleration, or optimize shuffle operations"
+                else:
+                    suggested_action += " | I/O bottleneck detected: Consider enabling elastic disk or storage-optimized node types"
+            
+            # Add memory spike warnings
+            if mem_spike_risk == "high":
+                suggested_action += " | HIGH MEMORY VOLATILITY: Add 20-30% headroom to prevent OOM. Investigate memory leaks"
+            elif mem_spike_risk == "moderate":
+                suggested_action += " | Moderate memory volatility: Add 10-15% headroom for safety"
+            
+            # Adjust recommendations for spot/preemptible instances
+            uses_spot = row.get("uses_spot_instances")
+            if uses_spot and (mem_cold or cpu_cold):
+                suggested_action += " (NOTE: Already using spot/preemptible - cost already optimized)"
+            elif not uses_spot and (mem_cold or cpu_cold):
+                suggested_action += " OR consider switching to spot/preemptible instances"
             
             # Calculate headroom
             cpu_headroom = round(1.0 - cpu_p50, 3)
@@ -316,6 +442,23 @@ class ClusterUtilizationCollector:
                 "mem_max": float(row.get("mem_max") or 0),
                 "mem_time_above_90pct": mem_time_90,
                 "mem_time_above_95pct": float(row.get("mem_time_above_95pct") or 0),
+                
+                # Memory volatility metrics (spike detection)
+                "mem_stddev": mem_stddev,
+                "mem_volatility": round(mem_p99 - mem_p50, 3),
+                "mem_spike_risk": mem_spike_risk,
+                
+                # I/O wait metrics (disk/network bottleneck detection)
+                "io_wait_p50": io_wait_p50,
+                "io_wait_p90": io_wait_p90,
+                "io_wait_time_above_20pct": io_wait_time_20,
+                "io_bound": io_bound,
+                "io_issue": io_issue,
+                
+                # Swap metrics (critical performance issue)
+                "swap_max": swap_max,
+                "swap_time_fraction": swap_time,
+                "swap_issue": swap_issue,
                 
                 # Analysis
                 "cpu_headroom_p50": cpu_headroom,
@@ -363,6 +506,11 @@ class ClusterUtilizationCollector:
         under_provisioned = [c for c in unique_clusters if c["overall_status"] == "under-provisioned"]
         right_sized = [c for c in unique_clusters if c["overall_status"] == "right-sized"]
         
+        # Count additional issues from detailed metrics
+        io_bound_count = sum(1 for m in cluster_metrics if m.get("io_bound") and m["component"] == "worker")
+        high_mem_spike_count = sum(1 for m in cluster_metrics if m.get("mem_spike_risk") == "high" and m["component"] == "worker")
+        swap_issue_count = sum(1 for m in cluster_metrics if m.get("swap_issue") and m["component"] == "worker")
+        
         # Calculate potential savings from over-provisioned clusters
         # Conservative estimate: 20-30% cost reduction potential
         over_provisioned_dbus = sum(c["total_dbus"] for c in over_provisioned)
@@ -378,6 +526,10 @@ class ClusterUtilizationCollector:
             "potential_savings_dbus": round(estimated_savings_dbus, 2),
             "over_provisioned_clusters": over_provisioned,
             "under_provisioned_clusters": under_provisioned,
+            # Additional issue counts
+            "io_bound_clusters": io_bound_count,
+            "high_memory_spike_clusters": high_mem_spike_count,
+            "swap_issue_clusters": swap_issue_count,
         }
     
     def _detect_idle_clusters(self, start_date: datetime, end_date: datetime) -> List[Dict[str, Any]]:
@@ -398,7 +550,9 @@ class ClusterUtilizationCollector:
                 WHERE nt.start_time >= '{start_date}'
                     AND nt.driver = false  -- Focus on workers
                 GROUP BY nt.cluster_id
-                HAVING COUNT(*) >= 60  -- At least 1 hour of data
+                -- FILTER: >= 60 samples - At least 1 hour of runtime data required for idle detection.
+                --         Each sample ~1 minute. Prevents false positives from clusters that just started.
+                HAVING COUNT(*) >= 60
             ),
             cluster_costs AS (
                 SELECT 
@@ -423,9 +577,12 @@ class ClusterUtilizationCollector:
             FROM cluster_usage cu
             LEFT JOIN cluster_costs cc ON cu.cluster_id = cc.cluster_id
             LEFT JOIN cluster_info ci ON cu.cluster_id = ci.cluster_id
-            WHERE cu.pct_time_idle > 0.5  -- Idle >50% of the time
-                AND cu.avg_cpu < 10  -- Average CPU <10%
+            -- FILTER: Idle cluster definition - >50% time with <5% CPU, and <10% average CPU overall.
+            --         These thresholds identify clusters running but doing almost no work.
+            WHERE cu.pct_time_idle > 0.5  -- Idle more than half the time
+                AND cu.avg_cpu < 10  -- Average CPU across all time <10%
             ORDER BY cc.total_dbus DESC NULLS LAST
+            -- FILTER: Top 20 idle clusters by cost - Focus on most expensive waste.
             LIMIT 20
             """
             
@@ -552,6 +709,8 @@ class ClusterUtilizationCollector:
                 FROM worker_counts wc
                 JOIN autoscale_clusters ac ON wc.cluster_id = ac.cluster_id
                 GROUP BY wc.cluster_id, ac.cluster_name, ac.min_autoscale_workers, ac.max_autoscale_workers
+                -- FILTER: >= 10 sample_hours - Need at least 10 hours of scaling data to assess effectiveness.
+                --         Prevents misleading conclusions from clusters that ran briefly.
                 HAVING COUNT(*) >= 10
             ),
             cluster_costs AS (
