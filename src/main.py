@@ -18,6 +18,7 @@ from src.collectors import (
     JobCollector,
     QueryCollector,
     WarehouseCollector,
+    ClusterUtilizationCollector,
 )
 from src.analyzers import (
     CostAnalyzer,
@@ -105,6 +106,10 @@ def main(
         query_collector = QueryCollector(db_client, config)
         queries_data = query_collector.collect(start_date, end_date)
         
+        logger.info("Collecting cluster utilization metrics...")
+        utilization_collector = ClusterUtilizationCollector(db_client, config)
+        utilization_data = utilization_collector.collect(days=(end_date - start_date).days)
+        
         # ============ ANALYZERS ============
         logger.info("Performing cost analysis...")
         cost_analyzer = CostAnalyzer(config)
@@ -126,7 +131,8 @@ def main(
         logger.info("Generating recommendations...")
         rec_engine = RecommendationEngine(config)
         recommendations = rec_engine.generate(
-            cost_analysis, cluster_analysis, job_analysis, sql_analysis, warehouses_data
+            cost_analysis, cluster_analysis, job_analysis, sql_analysis, 
+            warehouses_data, usage_data, utilization_data, queries_data
         )
         
         # ============ REPORTING ============
@@ -144,6 +150,8 @@ def main(
             recommendations,
             warehouses_data,
             queries_data,
+            usage_data,
+            utilization_data,
         )
         logger.info(f"Markdown report generated: {md_path}")
         

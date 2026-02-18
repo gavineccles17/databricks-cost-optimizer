@@ -59,6 +59,242 @@ class MarkdownReport:
         else:
             return "**VERY LOW** (<10% waste) - Excellent cost management already in place"
     
+    def _build_governance_section(self, usage_data: Dict[str, Any], monthly_cost: float) -> List[str]:
+        """Build governance insights section."""
+        lines = []
+        
+        tagging = usage_data.get("tagging_analysis", {})
+        patterns = usage_data.get("usage_patterns", {})
+        
+        has_tagging_data = tagging.get("tagged_dbus", 0) + tagging.get("untagged_dbus", 0) > 0
+        has_pattern_data = len(patterns.get("cost_by_day", {})) > 0
+        
+        if not has_tagging_data and not has_pattern_data:
+            return lines
+        
+        lines.extend([
+            "## Governance & Cost Attribution",
+            "",
+        ])
+        
+        # Tagging analysis
+        if has_tagging_data:
+            untagged_pct = tagging.get("untagged_percentage", 0)
+            total_dbus = tagging.get("tagged_dbus", 0) + tagging.get("untagged_dbus", 0)
+            untagged_dbus = tagging.get("untagged_dbus", 0)
+            # Estimate untagged cost as proportion of monthly spend
+            untagged_cost_estimate = monthly_cost * (untagged_pct / 100) if untagged_pct > 0 else 0
+            
+            if untagged_pct > 0:
+                status_emoji = "🔴" if untagged_pct >= 50 else ("🟡" if untagged_pct >= 20 else "🟢")
+                lines.extend([
+                    f"### Tag Compliance",
+                    "",
+                    f"{status_emoji} **{100 - untagged_pct:.1f}%** of spend is properly tagged",
+                    "",
+                    f"- **Unattributable Spend**: ~${untagged_cost_estimate:,.2f}/month ({untagged_pct:.1f}%)",
+                    f"- **Untagged DBUs**: {untagged_dbus:,.0f} of {total_dbus:,.0f}",
+                    "",
+                ])
+                if untagged_pct >= 20:
+                    lines.append("> 💡 **Action**: Implement tagging enforcement policy. Untagged resources cannot be attributed to teams/projects for chargeback.")
+                    lines.append("")
+        
+        # Usage patterns / weekend waste analysis
+        if has_pattern_data:
+            cost_by_day = patterns.get("cost_by_day", {})
+            weekend_ratio = patterns.get("weekend_to_weekday_ratio", 0)
+            weekend_dbus = patterns.get("weekend_dbus", 0)
+            weekday_dbus = patterns.get("weekday_dbus", 0)
+            total_dbus = weekend_dbus + weekday_dbus
+            # Estimate weekend cost as proportion of monthly spend
+            weekend_pct = patterns.get("weekend_percentage", 0)
+            weekend_cost_estimate = monthly_cost * (weekend_pct / 100) if weekend_pct > 0 else 0
+            
+            if weekend_ratio > 0.15:  # More than 15% of weekday activity on weekends
+                lines.extend([
+                    "### Weekend/Off-Hours Usage",
+                    "",
+                    f"⚠️ **Weekend-to-Weekday Ratio**: {weekend_ratio:.0%}",
+                    f"- **Estimated Weekend Spend**: ~${weekend_cost_estimate:,.2f}/month",
+                    "",
+                    "> 💡 **Investigation Needed**: Significant weekend usage detected. This could indicate forgotten notebooks, inefficient job scheduling, or legitimate production workloads.",
+                    "",
+                    "| Day | DBUs | % of Total |",
+                    "|-----|------|------------|",
+                ])
+                # Order days correctly
+                day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                for day_name in day_order:
+                    if day_name in cost_by_day:
+                        dbus = cost_by_day[day_name]
+                        pct = (dbus / total_dbus * 100) if total_dbus > 0 else 0
+                        lines.append(f"| {day_name} | {dbus:,.0f} | {pct:.1f}% |")
+                lines.append("")
+        
+        return lines
+    
+    def _build_utilization_section(self, utilization_data: Dict[str, Any], monthly_cost: float) -> List[str]:
+        """Build cluster utilization/rightsizing section based on CPU/memory metrics."""
+        lines = []
+        
+        if not utilization_data.get("available"):
+            return lines
+        
+        summary = utilization_data.get("summary", {})
+        cluster_metrics = utilization_data.get("cluster_metrics", [])
+        
+        total_analyzed = summary.get("total_clusters_analyzed", 0)
+        if total_analyzed == 0:
+            return lines
+        
+        over_count = summary.get("over_provisioned_count", 0)
+        under_count = summary.get("under_provisioned_count", 0)
+        right_count = summary.get("right_sized_count", 0)
+        over_dbus = summary.get("over_provisioned_dbus", 0)
+        potential_savings = summary.get("potential_savings_dbus", 0) * (monthly_cost / utilization_data.get("summary", {}).get("over_provisioned_dbus", 1) if over_dbus > 0 else 0.5)
+        
+        lines.extend([
+            "## Cluster Rightsizing Analysis",
+            "",
+            f"Analysis of CPU and memory utilization across **{total_analyzed}** highest-cost clusters:",
+            "",
+        ])
+        
+        # Summary stats
+        if over_count > 0 or under_count > 0:
+            over_pct = (over_count / total_analyzed * 100) if total_analyzed > 0 else 0
+            under_pct = (under_count / total_analyzed * 100) if total_analyzed > 0 else 0
+            right_pct = (right_count / total_analyzed * 100) if total_analyzed > 0 else 0
+            
+            lines.extend([
+                "| Status | Clusters | % | DBUs Affected |",
+                "|--------|----------|---|---------------|",
+                f"| ⬇️ Over-provisioned | {over_count} | {over_pct:.0f}% | {over_dbus:,.0f} |",
+                f"| ⬆️ Under-provisioned | {under_count} | {under_pct:.0f}% | {summary.get('under_provisioned_dbus', 0):,.0f} |",
+                f"| ✅ Right-sized | {right_count} | {right_pct:.0f}% | - |",
+                "",
+            ])
+            
+            if over_count > 0:
+                lines.append(f"> 💰 **Potential Savings**: ~25% reduction on over-provisioned clusters could save ~${potential_savings:,.2f}/month")
+                lines.append("")
+        
+        # Get worker metrics only for display (more impactful)
+        worker_metrics = [m for m in cluster_metrics if m.get("component") == "worker"][:10]
+        
+        if worker_metrics:
+            lines.extend([
+                "### Top Clusters by DBU Spend (Worker Nodes)",
+                "",
+                "| Cluster | DBUs | CPU P50 | CPU P90 | Mem P50 | Mem P95 | Status | Action |",
+                "|---------|------|---------|---------|---------|---------|--------|--------|",
+            ])
+            
+            for m in worker_metrics:
+                name = m.get("cluster_name", m.get("cluster_id", "unknown"))[:25]
+                dbus = m.get("total_dbus", 0)
+                cpu_p50 = m.get("cpu_p50", 0)
+                cpu_p90 = m.get("cpu_p90", 0)
+                mem_p50 = m.get("mem_p50", 0)
+                mem_p95 = m.get("mem_p95", 0)
+                status = m.get("overall_status", "unknown")
+                action = m.get("suggested_action", "")[:40]
+                
+                # Status emoji
+                if status == "over-provisioned":
+                    status_display = "⬇️ Over"
+                elif status == "under-provisioned":
+                    status_display = "⬆️ Under"
+                else:
+                    status_display = "✅ OK"
+                
+                lines.append(f"| {name} | {dbus:,.0f} | {cpu_p50:.0%} | {cpu_p90:.0%} | {mem_p50:.0%} | {mem_p95:.0%} | {status_display} | {action} |")
+            
+            lines.append("")
+            lines.extend([
+                "**Key Metrics Explained:**",
+                "- **CPU P50/P90**: Median and 90th percentile CPU utilization",
+                "- **Mem P50/P95**: Median and 95th percentile memory utilization",
+                "- **Over-provisioned**: P50 CPU <40% AND P50 memory <70% with <5% time above thresholds",
+                "- **Under-provisioned**: P90 CPU >85% OR P95 memory >95% OR >20% time above thresholds",
+                "",
+            ])
+        
+        # Idle clusters section
+        idle_clusters = utilization_data.get("idle_clusters", [])
+        if idle_clusters:
+            lines.extend([
+                "### 🔴 Idle Clusters Detected",
+                "",
+                f"Found **{len(idle_clusters)}** clusters that are running but essentially idle (<5% CPU for >50% of runtime):",
+                "",
+                "| Cluster | Avg CPU | % Time Idle | DBUs Consumed |",
+                "|---------|---------|-------------|---------------|",
+            ])
+            for c in idle_clusters[:10]:
+                name = c.get("cluster_name", "unknown")[:30]
+                avg_cpu = c.get("avg_cpu_percent", 0)
+                pct_idle = c.get("pct_time_idle", 0)
+                dbus = c.get("total_dbus", 0)
+                lines.append(f"| {name} | {avg_cpu:.1f}% | {pct_idle:.0f}% | {dbus:,.0f} |")
+            lines.extend([
+                "",
+                "> ⚠️ **Action Required**: These clusters are consuming DBUs but doing almost no work. Terminate or investigate immediately.",
+                "",
+            ])
+        
+        # Autoscale issues section
+        autoscale = utilization_data.get("autoscale_analysis", {})
+        never_down = autoscale.get("never_scales_down", [])
+        if never_down:
+            lines.extend([
+                "### ⚙️ Autoscaling Clusters That Never Scale Down",
+                "",
+                f"Found **{len(never_down)}** clusters with autoscaling that always run at/near max capacity:",
+                "",
+                "| Cluster | Min | Max | Avg Workers | Issue |",
+                "|---------|-----|-----|-------------|-------|",
+            ])
+            for c in never_down[:5]:
+                name = c.get("cluster_name", "unknown")[:25]
+                min_w = c.get("autoscale_min", 0)
+                max_w = c.get("autoscale_max", 0)
+                avg_w = c.get("avg_workers", 0)
+                lines.append(f"| {name} | {min_w} | {max_w} | {avg_w:.1f} | Never scales down |")
+            lines.extend([
+                "",
+                "> 💡 Consider switching to fixed-size clusters or tuning autoscaling triggers.",
+                "",
+            ])
+        
+        # Driver/worker imbalance section
+        imbalanced = utilization_data.get("driver_imbalance", [])
+        if imbalanced:
+            lines.extend([
+                "### 🔧 Driver/Worker Resource Imbalance",
+                "",
+                f"Found **{len(imbalanced)}** clusters with driver bottlenecks while workers are underutilized:",
+                "",
+                "| Cluster | Driver CPU | Worker CPU | Driver Mem | Worker Mem | Issue |",
+                "|---------|------------|------------|------------|------------|-------|",
+            ])
+            for c in imbalanced[:5]:
+                name = c.get("cluster_name", "unknown")[:20]
+                d_cpu = c.get("driver_cpu_p90", 0)
+                w_cpu = c.get("worker_cpu_p90", 0)
+                d_mem = c.get("driver_mem_p95", 0)
+                w_mem = c.get("worker_mem_p95", 0)
+                issue = c.get("issue", "").replace("_", " ")
+                lines.append(f"| {name} | {d_cpu:.0%} | {w_cpu:.0%} | {d_mem:.0%} | {w_mem:.0%} | {issue} |")
+            lines.extend([
+                "",
+                "> 💡 Driver bottlenecks usually indicate code collecting too much data to the driver. Refactor to keep processing on workers.",
+                "",
+            ])
+        
+        return lines
+    
     def generate(
         self,
         output_dir: Path,
@@ -69,6 +305,8 @@ class MarkdownReport:
         recommendations: List[Dict[str, Any]],
         warehouses_data: Dict[str, Any] = None,
         queries_data: Dict[str, Any] = None,
+        usage_data: Dict[str, Any] = None,
+        utilization_data: Dict[str, Any] = None,
     ) -> Path:
         """
         Generate a Markdown report.
@@ -82,6 +320,8 @@ class MarkdownReport:
             recommendations: List of recommendations
             warehouses_data: Data from warehouse collector
             queries_data: Data from query collector
+            usage_data: Usage data with tagging and pattern analysis
+            utilization_data: CPU/memory utilization data for rightsizing
         
         Returns:
             Path to generated report
@@ -92,7 +332,7 @@ class MarkdownReport:
         
         content = self._build_report(
             cost_analysis, cluster_analysis, job_analysis, sql_analysis, recommendations,
-            warehouses_data or {}, queries_data or {}
+            warehouses_data or {}, queries_data or {}, usage_data or {}, utilization_data or {}
         )
         
         report_path.write_text(content)
@@ -109,11 +349,15 @@ class MarkdownReport:
         recommendations: List[Dict[str, Any]],
         warehouses_data: Dict[str, Any] = None,
         queries_data: Dict[str, Any] = None,
+        usage_data: Dict[str, Any] = None,
+        utilization_data: Dict[str, Any] = None,
     ) -> str:
         """Build the complete report content."""
         
         warehouses_data = warehouses_data or {}
         queries_data = queries_data or {}
+        usage_data = usage_data or {}
+        utilization_data = utilization_data or {}
         
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         total_cost = cost_analysis.get("total_cost", 0)
@@ -151,6 +395,15 @@ class MarkdownReport:
             "",
             f"📊 **Annual Impact**: ${annual_savings:,.2f}/year = {self._estimate_business_impact(annual_savings)}",
             "",
+        ]
+        
+        # Governance Insights section
+        lines.extend(self._build_governance_section(usage_data, monthly_cost))
+        
+        # Cluster Utilization Analysis section
+        lines.extend(self._build_utilization_section(utilization_data, monthly_cost))
+        
+        lines.extend([
             "## Industry Benchmark Context",
             "",
             f"- **Your Savings Potential**: {savings_percentage:.1f}%",
@@ -331,6 +584,47 @@ class MarkdownReport:
                     savings = issue.get("estimated_savings", 0)
                     lines.append(f"- **[{severity}]** {wh_name}: {desc} (Est. savings: ${savings:,.2f}/month)")
                 lines.append("")
+            
+            # Long-running warehouses (currently active)
+            long_running = warehouses_data.get("long_running_warehouses", [])
+            if long_running:
+                lines.extend([
+                    "### 🕐 Currently Running Warehouses",
+                    "",
+                    "These warehouses are actively running right now:",
+                    "",
+                    "| Name | Size | Running Hours | Clusters |",
+                    "|------|------|---------------|----------|",
+                ])
+                for wh in long_running[:10]:
+                    name = wh.get("warehouse_name", "Unknown")[:25]
+                    size = wh.get("warehouse_size", "N/A")
+                    hours = wh.get("running_hours", 0)
+                    clusters = wh.get("cluster_count", 1)
+                    hours_emoji = "🔴" if hours > 8 else ("🟡" if hours > 4 else "")
+                    lines.append(f"| {name} | {size} | {hours_emoji} {hours:.1f}h | {clusters} |")
+                lines.append("")
+                lines.append("> ⚠️ Verify these are actively being used. Stop idle warehouses to save costs.")
+                lines.append("")
+            
+            # Upscaled warehouses
+            upscaled = warehouses_data.get("upscaled_warehouses", [])
+            if upscaled:
+                lines.extend([
+                    "### 📈 Scaled-Up Warehouses",
+                    "",
+                    "These warehouses have been running with multiple clusters:",
+                    "",
+                    "| Name | Clusters | Max | Upscaled Hours |",
+                    "|------|----------|-----|----------------|",
+                ])
+                for wh in upscaled[:5]:
+                    name = wh.get("warehouse_name", "Unknown")[:25]
+                    current = wh.get("current_clusters", 2)
+                    max_c = wh.get("max_clusters", current)
+                    hours = wh.get("upscaled_hours", 0)
+                    lines.append(f"| {name} | {current} | {max_c} | {hours:.1f}h |")
+                lines.append("")
         
         lines.extend([
             "",
@@ -409,6 +703,9 @@ class MarkdownReport:
             "## Job Analysis",
             "",
             f"- **Jobs with Usage**: {job_analysis.get('job_count', 0)}",
+            f"- **Total Job Cost**: ${job_analysis.get('total_job_cost', 0):,.2f}",
+            f"- **Wasted on Failed Runs**: ${job_analysis.get('total_wasted_on_failures', 0):,.2f}",
+            f"- **Jobs with Efficiency Issues**: {job_analysis.get('jobs_with_issues', 0)}",
             "",
         ])
         
@@ -417,12 +714,76 @@ class MarkdownReport:
             lines.extend([
                 "### Top Jobs by Cost",
                 "",
-                "| Job Name | Runs | DBUs | Cost |",
-                "|----------|------|------|------|",
+                "| Job Name | Runs | Avg Duration | Cost/Run | Total Cost | Failure % |",
+                "|----------|------|--------------|----------|------------|-----------|",
             ])
             for job in jobs[:10]:
                 name = job.get("job_name") or job.get("job_id", "N/A")
-                lines.append(f"| {str(name)[:30]} | {job.get('run_count', 0)} | {job.get('total_dbus', 0):,.2f} | ${job.get('total_cost', 0):,.2f} |")
+                name_str = str(name)[:25]
+                run_count = job.get("run_count", 0)
+                avg_duration = job.get("avg_duration_seconds", 0)
+                if avg_duration >= 60:
+                    dur_str = f"{avg_duration/60:.1f}m"
+                else:
+                    dur_str = f"{avg_duration:.0f}s" if avg_duration else "N/A"
+                cost_per_run = job.get("cost_per_run", 0)
+                total_cost = job.get("total_cost", 0)
+                failure_rate = job.get("failure_rate", 0)
+                
+                lines.append(f"| {name_str} | {run_count} | {dur_str} | ${cost_per_run:.3f} | ${total_cost:,.2f} | {failure_rate:.0f}% |")
+        
+        # Efficiency issues
+        efficiency_issues = job_analysis.get("efficiency_issues", [])
+        if efficiency_issues:
+            lines.extend([
+                "",
+                "### Job Efficiency Issues",
+                "",
+            ])
+            for issue in efficiency_issues[:10]:
+                severity = issue.get("severity", "medium").upper()
+                job_name = issue.get("job_name", "Unknown")[:30]
+                desc = issue.get("description", "")
+                lines.append(f"- **[{severity}]** {job_name}: {desc}")
+            lines.append("")
+        
+        # High failure jobs
+        high_failure_jobs = job_analysis.get("high_failure_jobs", [])
+        if high_failure_jobs:
+            lines.extend([
+                "",
+                "### Jobs with High Failure Rates",
+                "",
+                "| Job Name | Failure Rate | Wasted Cost | Run Count |",
+                "|----------|--------------|-------------|-----------|",
+            ])
+            for job in high_failure_jobs[:5]:
+                name = str(job.get("job_name", "Unknown"))[:25]
+                lines.append(f"| {name} | {job.get('failure_rate', 0):.1f}% | ${job.get('wasted_cost', 0):,.2f} | {job.get('run_count', 0)} |")
+            lines.append("")
+        
+        # Short run overhead jobs
+        short_run_jobs = job_analysis.get("short_run_overhead_jobs", [])
+        if short_run_jobs:
+            lines.extend([
+                "",
+                "### Jobs with High Startup Overhead",
+                "",
+                "> These jobs run briefly but cost relatively more per run due to cluster startup time.",
+                "",
+                "| Job Name | Avg Duration | Cost/Run | Total Cost |",
+                "|----------|--------------|----------|------------|",
+            ])
+            for job in short_run_jobs[:5]:
+                name = str(job.get("job_name", "Unknown"))[:25]
+                avg_dur = job.get("avg_duration_seconds", 0)
+                dur_str = f"{avg_dur:.0f}s" if avg_dur < 60 else f"{avg_dur/60:.1f}m"
+                lines.append(f"| {name} | {dur_str} | ${job.get('cost_per_run', 0):.3f} | ${job.get('total_cost', 0):,.2f} |")
+            lines.extend([
+                "",
+                "> 💡 **Tip**: Use cluster pools or serverless compute to reduce startup overhead for short-running jobs.",
+                "",
+            ])
         
         lines.extend([
             "",
@@ -495,6 +856,46 @@ class MarkdownReport:
                     total_str = f"{total_dur:.0f}s"
                 
                 lines.append(f"| {user} | {count} | {avg_dur:.1f}s | {total_str} |")
+            lines.append("")
+        
+        # Disk spill analysis
+        disk_spill = queries_data.get("disk_spill_analysis", {})
+        warehouses_with_spill = disk_spill.get("warehouses_with_spill", [])
+        if warehouses_with_spill and disk_spill.get("has_significant_spill"):
+            lines.extend([
+                "### 💾 Disk Spill Detected",
+                "",
+                "Some warehouses are running out of memory and writing to disk (slower). Consider upsizing:",
+                "",
+                "| Warehouse ID | Spill Frequency | Max Spill | Needs Upsize? |",
+                "|--------------|-----------------|-----------|---------------|",
+            ])
+            for wh in warehouses_with_spill[:5]:
+                wh_id = (wh.get("warehouse_id") or "unknown")[:15]
+                freq = wh.get("spill_frequency", 0)
+                max_gb = wh.get("max_spilled_gb", 0)
+                needs = "⚠️ Yes" if wh.get("needs_upsize") else "No"
+                lines.append(f"| {wh_id} | {freq} queries | {max_gb:.1f}GB | {needs} |")
+            lines.append("")
+        
+        # Shuffle analysis
+        shuffle_data = queries_data.get("shuffle_analysis", {})
+        shuffle_queries = shuffle_data.get("shuffle_heavy_queries", [])
+        if shuffle_queries:
+            lines.extend([
+                "### 🔀 Shuffle-Heavy Queries",
+                "",
+                "Queries moving large amounts of data between nodes (optimization candidates):",
+                "",
+                "| User | Shuffle | Duration | Preview |",
+                "|------|---------|----------|---------|",
+            ])
+            for q in shuffle_queries[:5]:
+                user = (q.get("user") or "N/A").split("@")[0][:12]
+                shuffle_gb = q.get("shuffle_gb", 0)
+                dur = q.get("duration_seconds", 0)
+                preview = (q.get("statement_preview") or "")[:40].replace("|", "/")
+                lines.append(f"| {user} | {shuffle_gb:.1f}GB | {dur:.0f}s | {preview}... |")
             lines.append("")
         
         lines.append("### Common Issues")

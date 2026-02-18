@@ -39,6 +39,10 @@ class WarehouseCollector:
         # Get warehouse events for utilization analysis
         warehouse_events = self._collect_warehouse_events(start_date, end_date)
         
+        # Detect long-running and upscaled warehouses
+        long_running = self._detect_long_running_warehouses()
+        upscaled_too_long = self._detect_upscaled_warehouses()
+        
         # Merge costs with warehouse configs
         warehouses_with_costs = self._merge_warehouse_data(warehouses, warehouse_costs)
         
@@ -51,6 +55,8 @@ class WarehouseCollector:
             "warehouse_count": len(warehouses),
             "issues": issues,
             "issue_count": len(issues),
+            "long_running_warehouses": long_running,
+            "upscaled_warehouses": upscaled_too_long,
             "period": {
                 "start": start_date.isoformat(),
                 "end": end_date.isoformat(),
@@ -284,3 +290,105 @@ class WarehouseCollector:
                 })
         
         return issues
+    
+    def _detect_long_running_warehouses(self) -> List[Dict]:
+        """
+        Detect warehouses that are currently running and for how long.
+        Based on Query 1 from Databricks community blog.
+        """
+        try:
+            query = """
+            SELECT
+                we.warehouse_id,
+                w.warehouse_name,
+                w.warehouse_size,
+                we.event_time,
+                TIMESTAMPDIFF(MINUTE, we.event_time, CURRENT_TIMESTAMP()) / 60.0 AS running_hours,
+                we.cluster_count
+            FROM system.compute.warehouse_events we
+            LEFT JOIN system.compute.warehouses w ON we.warehouse_id = w.warehouse_id
+            WHERE we.event_type = 'RUNNING'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM system.compute.warehouse_events we2
+                    WHERE we2.warehouse_id = we.warehouse_id
+                    AND we2.event_time > we.event_time
+                )
+            ORDER BY running_hours DESC
+            """
+            results = self.client.execute_query(query)
+            
+            long_running = []
+            for row in results:
+                running_hours = float(row.get("running_hours") or 0)
+                if running_hours > 1:  # Only flag if running > 1 hour
+                    long_running.append({
+                        "warehouse_id": row.get("warehouse_id"),
+                        "warehouse_name": row.get("warehouse_name") or "Unknown",
+                        "warehouse_size": row.get("warehouse_size"),
+                        "running_hours": round(running_hours, 2),
+                        "cluster_count": int(row.get("cluster_count") or 1),
+                        "event_time": str(row.get("event_time")),
+                    })
+            
+            logger.info(f"Found {len(long_running)} warehouses currently running >1 hour")
+            return long_running
+            
+        except Exception as e:
+            logger.warning(f"Could not detect long-running warehouses: {str(e)}")
+            return []
+    
+    def _detect_upscaled_warehouses(self) -> List[Dict]:
+        """
+        Detect warehouses that have been scaled up and remain in that state.
+        Based on Query 2 from Databricks community blog.
+        """
+        try:
+            query = """
+            SELECT
+                we.warehouse_id,
+                w.warehouse_name,
+                w.warehouse_size,
+                w.max_clusters,
+                we.event_time,
+                TIMESTAMPDIFF(MINUTE, we.event_time, CURRENT_TIMESTAMP()) / 60.0 AS upscaled_hours,
+                we.cluster_count
+            FROM system.compute.warehouse_events we
+            LEFT JOIN system.compute.warehouses w ON we.warehouse_id = w.warehouse_id
+            WHERE we.event_type = 'SCALED_UP'
+                AND we.cluster_count >= 2
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM system.compute.warehouse_events we2
+                    WHERE we2.warehouse_id = we.warehouse_id
+                    AND (
+                        we2.event_type = 'SCALED_DOWN'
+                        OR we2.event_type = 'STOPPED'
+                        OR (we2.event_type = 'SCALED_UP' AND we2.cluster_count < we.cluster_count)
+                    )
+                    AND we2.event_time > we.event_time
+                )
+            ORDER BY upscaled_hours DESC
+            """
+            results = self.client.execute_query(query)
+            
+            upscaled = []
+            for row in results:
+                upscaled_hours = float(row.get("upscaled_hours") or 0)
+                if upscaled_hours > 0.5:  # Only flag if scaled up > 30 minutes
+                    upscaled.append({
+                        "warehouse_id": row.get("warehouse_id"),
+                        "warehouse_name": row.get("warehouse_name") or "Unknown",
+                        "warehouse_size": row.get("warehouse_size"),
+                        "max_clusters": int(row.get("max_clusters") or 1),
+                        "current_clusters": int(row.get("cluster_count") or 1),
+                        "upscaled_hours": round(upscaled_hours, 2),
+                        "event_time": str(row.get("event_time")),
+                    })
+            
+            logger.info(f"Found {len(upscaled)} warehouses currently scaled up")
+            return upscaled
+            
+        except Exception as e:
+            logger.warning(f"Could not detect upscaled warehouses: {str(e)}")
+            return []

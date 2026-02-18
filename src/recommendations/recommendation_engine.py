@@ -21,6 +21,9 @@ class RecommendationEngine:
         job_analysis: Dict[str, Any],
         sql_analysis: Dict[str, Any],
         warehouses_data: Dict[str, Any] = None,
+        usage_data: Dict[str, Any] = None,
+        utilization_data: Dict[str, Any] = None,
+        queries_data: Dict[str, Any] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generate actionable recommendations focused on quick infrastructure wins.
@@ -38,6 +41,9 @@ class RecommendationEngine:
         
         recommendations = []
         warehouses_data = warehouses_data or {}
+        usage_data = usage_data or {}
+        utilization_data = utilization_data or {}
+        queries_data = queries_data or {}
         
         total_dbus = cost_analysis.get("total_dbus", 0)
         total_cost = cost_analysis.get("total_cost", 0)
@@ -53,16 +59,27 @@ class RecommendationEngine:
         recommendations.extend(self._cluster_auto_terminate(cluster_analysis, cost_analysis))
         recommendations.extend(self._warehouse_auto_stop(warehouses_data))
         recommendations.extend(self._warehouse_sizing(warehouses_data))
+        recommendations.extend(self._warehouse_long_running(warehouses_data))
         recommendations.extend(self._all_purpose_to_jobs(cost_by_product, total_cost))
         recommendations.extend(self._photon_evaluation(cost_by_product, cost_analysis))
         recommendations.extend(self._serverless_opportunities(cost_by_product, job_analysis))
         recommendations.extend(self._cluster_sizing(cluster_analysis))
+        recommendations.extend(self._cluster_rightsizing(utilization_data, cost_analysis))
+        recommendations.extend(self._idle_clusters(utilization_data, cost_analysis))
+        recommendations.extend(self._autoscale_issues(utilization_data, cost_analysis))
+        recommendations.extend(self._driver_worker_imbalance(utilization_data))
         recommendations.extend(self._model_serving_scale_to_zero(cost_by_product))
+        recommendations.extend(self._job_efficiency_issues(job_analysis))
+        recommendations.extend(self._weekend_waste(usage_data, cost_analysis))
         
         # MEDIUM PRIORITY: Operational improvements
         recommendations.extend(self._spot_instances(cluster_analysis, job_analysis))
-        recommendations.extend(self._cluster_pools(cluster_analysis))
+        recommendations.extend(self._cluster_pools(cluster_analysis, job_analysis))
         recommendations.extend(self._job_frequency(job_analysis))
+        recommendations.extend(self._tagging_governance(usage_data))
+        recommendations.extend(self._delta_optimization(sql_analysis, cost_analysis))
+        recommendations.extend(self._disk_spill_upsize(queries_data, warehouses_data))
+        recommendations.extend(self._shuffle_heavy_queries(queries_data))
         
         # LOW PRIORITY: Code-level optimizations (only if very significant)
         recommendations.extend(self._sql_quick_wins(sql_analysis, cost_by_product))
@@ -232,6 +249,150 @@ class RecommendationEngine:
                     "insight": f"With min={min_clusters}, you pay for {min_clusters} clusters even at 2 AM. Set min=1 and let auto-scaling handle peaks.",
                     "effort": "1 minute",
                 })
+        
+        return recs
+    
+    def _warehouse_long_running(self, warehouses_data: Dict) -> List[Dict]:
+        """Flag warehouses that have been running or scaled up for too long."""
+        recs = []
+        
+        # Long-running warehouses
+        long_running = warehouses_data.get("long_running_warehouses", [])
+        if long_running:
+            # Estimate hourly cost based on warehouse size
+            for wh in long_running:
+                running_hours = wh.get("running_hours", 0)
+                if running_hours > 4:  # Only flag if >4 hours continuous
+                    wh_name = wh.get("warehouse_name", "Unknown")
+                    cluster_count = wh.get("cluster_count", 1)
+                    wh_size = wh.get("warehouse_size", "MEDIUM")
+                    
+                    # Rough hourly cost estimate by size
+                    hourly_rates = {"SMALL": 2, "MEDIUM": 4, "LARGE": 8, "X-LARGE": 16, "2X-LARGE": 32}
+                    base_rate = hourly_rates.get(str(wh_size).upper(), 4)
+                    estimated_cost = running_hours * base_rate * cluster_count
+                    
+                    recs.append({
+                        "id": f"wh_long_run_{wh.get('warehouse_id', 'unknown')[:8]}",
+                        "title": f"🕐 Warehouse '{wh_name}' running for {running_hours:.1f} hours",
+                        "severity": "high" if running_hours > 8 else "medium",
+                        "category": "warehouse",
+                        "description": f"Warehouse '{wh_name}' has been continuously running for {running_hours:.1f} hours with {cluster_count} cluster(s). Verify if this is intentional.",
+                        "estimated_savings": round(estimated_cost * 0.5 * self.confidence_factor, 2),
+                        "steps": [
+                            "Check if the warehouse is actively being used",
+                            "Review Query History for recent activity",
+                            "If idle, stop the warehouse manually",
+                            "Ensure auto-stop is configured (recommend 10-15 min)",
+                        ],
+                        "insight": f"A {wh_size} warehouse running {running_hours:.1f}h costs ~${estimated_cost:.0f}. If no queries are running, this is waste.",
+                        "effort": "1 minute to stop",
+                    })
+        
+        # Upscaled warehouses
+        upscaled = warehouses_data.get("upscaled_warehouses", [])
+        if upscaled:
+            for wh in upscaled:
+                upscaled_hours = wh.get("upscaled_hours", 0)
+                if upscaled_hours > 1:  # Only flag if scaled up >1 hour
+                    wh_name = wh.get("warehouse_name", "Unknown")
+                    current_clusters = wh.get("current_clusters", 2)
+                    max_clusters = wh.get("max_clusters", current_clusters)
+                    
+                    recs.append({
+                        "id": f"wh_upscaled_{wh.get('warehouse_id', 'unknown')[:8]}",
+                        "title": f"📈 Warehouse '{wh_name}' scaled up for {upscaled_hours:.1f} hours",
+                        "severity": "medium",
+                        "category": "warehouse",
+                        "description": f"Warehouse '{wh_name}' has been running at {current_clusters} clusters (max: {max_clusters}) for {upscaled_hours:.1f} hours. This may indicate lack of scale-down activity.",
+                        "estimated_savings": round(upscaled_hours * 4 * (current_clusters - 1) * self.confidence_factor, 2),
+                        "steps": [
+                            "Review query concurrency - do you need this many clusters?",
+                            "Check if auto-scaling down is triggering",
+                            "Consider reducing max_clusters if rarely needed",
+                            "Review query patterns - batch queries if possible",
+                        ],
+                        "insight": f"Each additional cluster doubles cost. If queries aren't queuing, you may not need {current_clusters} clusters.",
+                        "effort": "5 minutes to review settings",
+                    })
+        
+        return recs
+    
+    def _disk_spill_upsize(self, queries_data: Dict, warehouses_data: Dict) -> List[Dict]:
+        """Recommend upsizing warehouses that experience disk spill."""
+        recs = []
+        
+        disk_spill = queries_data.get("disk_spill_analysis", {})
+        warehouses_with_spill = disk_spill.get("warehouses_with_spill", [])
+        
+        # Build warehouse name lookup
+        wh_names = {}
+        for wh in warehouses_data.get("warehouses", []):
+            wh_names[wh.get("warehouse_id")] = wh.get("warehouse_name", "Unknown")
+        
+        for wh_spill in warehouses_with_spill:
+            if wh_spill.get("needs_upsize"):
+                wh_id = wh_spill.get("warehouse_id")
+                wh_name = wh_names.get(wh_id, wh_id or "Unknown")
+                spill_freq = wh_spill.get("spill_frequency", 0)
+                max_spill_gb = wh_spill.get("max_spilled_gb", 0)
+                
+                recs.append({
+                    "id": f"disk_spill_{str(wh_id)[:8]}",
+                    "title": f"💾 Upsize warehouse '{wh_name}' - experiencing disk spill",
+                    "severity": "medium",
+                    "category": "warehouse",
+                    "description": f"Warehouse '{wh_name}' has {spill_freq} queries that spilled to disk (max: {max_spill_gb:.1f}GB). Disk spill indicates memory pressure and degrades performance.",
+                    "estimated_savings": 0,  # Actually costs more but improves performance
+                    "steps": [
+                        "Disk spill = queries running out of memory and writing to slower disk",
+                        f"This warehouse had {spill_freq} queries spill to disk",
+                        "Upsize to the next t-shirt size (e.g., MEDIUM → LARGE)",
+                        "OR optimize queries to use less memory (e.g., reduce shuffles)",
+                    ],
+                    "insight": f"While upsizing costs more per hour, queries complete faster with less spill. Often net-neutral or cheaper overall.",
+                    "effort": "2 minutes to change size, test queries",
+                })
+        
+        return recs
+    
+    def _shuffle_heavy_queries(self, queries_data: Dict) -> List[Dict]:
+        """Flag queries with excessive shuffle as optimization candidates."""
+        recs = []
+        
+        shuffle_data = queries_data.get("shuffle_analysis", {})
+        shuffle_queries = shuffle_data.get("shuffle_heavy_queries", [])
+        total_shuffle = shuffle_data.get("total_shuffle_queries", 0)
+        
+        if total_shuffle >= 5:  # Only if multiple shuffle-heavy queries
+            # Get worst offenders
+            worst = shuffle_queries[:3]
+            query_examples = []
+            for q in worst:
+                preview = (q.get("statement_preview") or "")[:100]
+                shuffle_gb = q.get("shuffle_gb", 0)
+                query_examples.append(f"  - {shuffle_gb:.1f}GB shuffle: {preview}...")
+            
+            recs.append({
+                "id": "shuffle_heavy_queries",
+                "title": f"🔀 {total_shuffle} queries with excessive shuffle detected",
+                "severity": "low",
+                "category": "sql",
+                "description": f"Found {total_shuffle} queries that shuffle large amounts of data between nodes. High shuffle indicates inefficient queries or poor table structure.",
+                "estimated_savings": 0,  # Requires code changes
+                "steps": [
+                    "Shuffle = data movement between nodes (slow & expensive)",
+                    "Common causes:",
+                    "  - JOINs on non-partitioned columns",
+                    "  - GROUP BY on high-cardinality columns",
+                    "  - Uneven data distribution (skew)",
+                    "Review these queries:",
+                ] + query_examples + [
+                    "Consider: partition tables by join keys, use broadcast joins for small tables",
+                ],
+                "insight": "Reducing shuffle improves query speed and reduces compute time. Focus on your most expensive queries first.",
+                "effort": "1-4 hours per query to optimize",
+            })
         
         return recs
     
@@ -469,13 +630,93 @@ class RecommendationEngine:
         
         return recs
     
-    def _cluster_pools(self, cluster_analysis: Dict) -> List[Dict]:
-        """Recommend cluster pools for faster startup."""
+    def _job_efficiency_issues(self, job_analysis: Dict) -> List[Dict]:
+        """Generate recommendations from job efficiency analysis."""
         recs = []
         
-        cluster_costs = cluster_analysis.get("cluster_costs", [])
+        efficiency_issues = job_analysis.get("efficiency_issues", [])
         
-        if len(cluster_costs) >= 2:
+        for issue in efficiency_issues:
+            issue_type = issue.get("type")
+            job_name = issue.get("job_name", "Unknown")
+            job_id = str(issue.get("job_id", "unknown"))
+            
+            if issue_type == "high_failure_rate":
+                failure_rate = issue.get("failure_rate", 0)
+                wasted_cost = issue.get("wasted_cost", 0)
+                
+                if wasted_cost >= 1:  # Only if significant waste
+                    recs.append({
+                        "id": f"job_failures_{job_id[:12]}",
+                        "title": f"🔴 Fix failing job '{job_name[:25]}' ({failure_rate:.0f}% failure rate)",
+                        "severity": "high",
+                        "category": "jobs",
+                        "description": f"Job '{job_name}' fails {failure_rate:.0f}% of the time, wasting ~${wasted_cost:.2f} in the analysis period on failed runs.",
+                        "estimated_savings": round(wasted_cost * self.confidence_factor, 2),
+                        "steps": [
+                            "Check job run logs for error patterns",
+                            "Common causes: data issues, resource exhaustion, timeout",
+                            "Add error handling and retries for transient failures",
+                            "Consider alerting on job failures",
+                        ],
+                        "insight": "Failed runs still consume compute resources and cost money.",
+                        "effort": "Varies - depends on root cause",
+                    })
+            
+            elif issue_type == "startup_overhead":
+                avg_duration = issue.get("avg_duration", 0)
+                cost_per_run = issue.get("cost_per_run", 0)
+                
+                if cost_per_run >= 0.10:  # $0.10+ per run is notable
+                    recs.append({
+                        "id": f"job_startup_{job_id[:12]}",
+                        "title": f"Job '{job_name[:25]}' has high startup overhead ({avg_duration:.0f}s runtime, ${cost_per_run:.2f}/run)",
+                        "severity": "medium",
+                        "category": "jobs",
+                        "description": f"Job only runs for {avg_duration:.0f} seconds but costs ${cost_per_run:.2f} per run. Cluster startup time likely exceeds actual work time.",
+                        "estimated_savings": round(cost_per_run * 10 * 0.5 * self.confidence_factor, 2),
+                        "steps": [
+                            "Option 1: Use cluster pools - pre-warmed instances start in <1 min",
+                            "Option 2: Batch multiple short jobs into one",
+                            "Option 3: Use serverless jobs - no startup overhead",
+                            "Option 4: If job runs frequently, keep cluster warm between runs",
+                        ],
+                        "insight": f"If startup takes 5 min but job runs {avg_duration:.0f}s, you're paying mostly for waiting.",
+                        "effort": "15-30 minutes",
+                    })
+        
+        return recs
+    
+    def _cluster_pools(self, cluster_analysis: Dict, job_analysis: Dict = None) -> List[Dict]:
+        """Recommend cluster pools for faster startup based on cluster and job data."""
+        recs = []
+        job_analysis = job_analysis or {}
+        
+        cluster_costs = cluster_analysis.get("cluster_costs", [])
+        short_run_jobs = job_analysis.get("short_run_overhead_jobs", [])
+        
+        # Strong signal: jobs with short runtimes but high cost per run
+        if short_run_jobs and len(short_run_jobs) >= 2:
+            total_affected_cost = sum(j.get("total_cost", 0) for j in short_run_jobs)
+            job_names = [j.get("job_name", "")[:20] for j in short_run_jobs[:3]]
+            
+            recs.append({
+                "id": "cluster_pools_startup",
+                "title": f"Use cluster pools to reduce startup overhead ({len(short_run_jobs)} short-running jobs detected)",
+                "severity": "medium",
+                "category": "cluster",
+                "description": f"Jobs like {', '.join(job_names)} have short runtimes but high cost per run - cluster startup dominates. Pools can reduce startup from 5-10 min to <1 min.",
+                "estimated_savings": round(total_affected_cost * 0.3 * self.confidence_factor, 2),
+                "steps": [
+                    "Compute → Pools → Create Pool",
+                    "Set min_idle_instances=1-2 based on job frequency",
+                    "Edit job cluster configs to use the pool",
+                    "Monitor: pools have a small cost for idle instances",
+                ],
+                "insight": "For short jobs, startup time can cost more than the actual job. Pools amortize this.",
+                "effort": "15 minutes to set up",
+            })
+        elif len(cluster_costs) >= 2:
             total_cost = sum(float(c.get("total_cost", 0) or 0) for c in cluster_costs)
             if total_cost > 1:
                 recs.append({
@@ -565,6 +806,399 @@ class RecommendationEngine:
                 ],
                 "insight": "Partitioning is a one-time change that benefits all future queries on that table. Best ROI for frequently-queried large tables.",
                 "effort": "30-60 minutes per table",
+            })
+        
+        return recs
+    
+    def _cluster_rightsizing(self, utilization_data: Dict, cost_analysis: Dict) -> List[Dict]:
+        """Generate rightsizing recommendations based on actual CPU/memory utilization."""
+        recs = []
+        
+        if not utilization_data.get("available"):
+            return recs  # node_timeline not accessible
+        
+        summary = utilization_data.get("summary", {})
+        cluster_metrics = utilization_data.get("cluster_metrics", [])
+        
+        over_provisioned_count = summary.get("over_provisioned_count", 0)
+        under_provisioned_count = summary.get("under_provisioned_count", 0)
+        over_provisioned_dbus = summary.get("over_provisioned_dbus", 0)
+        potential_savings_dbus = summary.get("potential_savings_dbus", 0)
+        
+        # Get average DBU price from cost analysis
+        total_cost = cost_analysis.get("total_cost", 0)
+        total_dbus = cost_analysis.get("total_dbus", 0)
+        avg_dbu_price = (total_cost / total_dbus) if total_dbus > 0 else 0.50
+        
+        # Over-provisioned clusters - downsize opportunity
+        if over_provisioned_count > 0 and potential_savings_dbus > 10:
+            estimated_savings = potential_savings_dbus * avg_dbu_price
+            
+            # Get details of top over-provisioned clusters
+            over_clusters = summary.get("over_provisioned_clusters", [])[:5]
+            top_clusters_info = []
+            for c in over_clusters:
+                name = c.get("cluster_name", c.get("cluster_id", "unknown"))
+                dbus = c.get("total_dbus", 0)
+                action = c.get("suggested_action", "")
+                top_clusters_info.append(f"  - {name}: {dbus:.0f} DBUs - {action}")
+            
+            steps = [
+                "Review CPU/memory utilization percentiles in the report",
+                "For clusters with <40% median CPU AND <70% median memory:",
+            ]
+            if top_clusters_info:
+                steps.append("Priority clusters to downsize:")
+                steps.extend(top_clusters_info[:3])
+            steps.extend([
+                "Reduce worker count or switch to smaller instance types",
+                "Consider autoscaling with lower min_workers",
+                "Monitor for 1-2 weeks before finalizing changes",
+            ])
+            
+            recs.append({
+                "id": "rightsize_overprovisioned",
+                "title": f"⬇️ Rightsize {over_provisioned_count} over-provisioned clusters (based on actual utilization)",
+                "severity": "high",
+                "category": "cluster",
+                "description": f"{over_provisioned_count} clusters show consistently low CPU/memory utilization (P50 CPU <40%, P50 memory <70%), indicating over-provisioning. Combined DBU spend: {over_provisioned_dbus:,.0f} DBUs.",
+                "estimated_savings": round(estimated_savings * self.confidence_factor, 2),
+                "steps": steps,
+                "insight": f"These clusters spend <5% of time above 80% CPU utilization, meaning they're rarely under load. ~25% cost reduction is achievable by downsizing.",
+                "effort": "1-2 hours per cluster to analyze and adjust",
+                "evidence": {
+                    "clusters_analyzed": summary.get("total_clusters_analyzed", 0),
+                    "over_provisioned": over_provisioned_count,
+                    "dbus_affected": round(over_provisioned_dbus, 2),
+                },
+            })
+        
+        # Under-provisioned clusters - performance risk
+        if under_provisioned_count > 0:
+            under_clusters = summary.get("under_provisioned_clusters", [])[:5]
+            under_clusters_info = []
+            for c in under_clusters:
+                name = c.get("cluster_name", c.get("cluster_id", "unknown"))
+                action = c.get("suggested_action", "")
+                under_clusters_info.append(f"  - {name}: {action}")
+            
+            steps = [
+                "Review CPU/memory pressure metrics in the report",
+                "For clusters with P90 CPU >85% OR P95 memory >95%:",
+            ]
+            if under_clusters_info:
+                steps.append("Priority clusters to upsize:")
+                steps.extend(under_clusters_info[:3])
+            steps.extend([
+                "Increase worker count or use larger instance types",
+                "Consider horizontal scaling (more nodes) for CPU pressure",
+                "Consider vertical scaling (more memory) for memory pressure",
+            ])
+            
+            recs.append({
+                "id": "rightsize_underprovisioned",
+                "title": f"⬆️ Scale up {under_provisioned_count} under-provisioned clusters (performance risk)",
+                "severity": "medium",
+                "category": "cluster",
+                "description": f"{under_provisioned_count} clusters show high CPU/memory pressure (P90 CPU >85% or P95 memory >95%), risking performance degradation or OOM failures.",
+                "estimated_savings": 0,  # Costs more but improves reliability
+                "steps": steps,
+                "insight": "Under-provisioned clusters cause slower jobs and potential failures, impacting data freshness and SLAs. Scaling up improves reliability.",
+                "effort": "1-2 hours per cluster to analyze and adjust",
+            })
+        
+        # Individual cluster recommendations if there are many details
+        for metric in cluster_metrics[:5]:  # Top 5 by DBU spend
+            if metric.get("overall_status") == "over-provisioned" and metric.get("component") == "worker":
+                cluster_name = metric.get("cluster_name", metric.get("cluster_id"))
+                cpu_p50 = metric.get("cpu_p50", 0)
+                mem_p50 = metric.get("mem_p50", 0)
+                cpu_headroom = metric.get("cpu_headroom_p50", 0)
+                mem_headroom = metric.get("mem_headroom_p95", 0)
+                dbus = metric.get("total_dbus", 0)
+                
+                if dbus > 50 and cpu_headroom > 0.5:  # >50% CPU headroom
+                    recs.append({
+                        "id": f"rightsize_{metric.get('cluster_id', 'unknown')[:8]}",
+                        "title": f"Downsize cluster '{cluster_name}' ({cpu_headroom:.0%} CPU headroom)",
+                        "severity": "medium",
+                        "category": "cluster",
+                        "description": f"Cluster '{cluster_name}' uses only {cpu_p50:.0%} median CPU and {mem_p50:.0%} median memory. With {dbus:,.0f} DBUs consumed, downsizing could save ~{dbus * 0.25 * avg_dbu_price:.2f}.",
+                        "estimated_savings": round(dbus * 0.25 * avg_dbu_price * self.confidence_factor, 2),
+                        "steps": [
+                            f"Current performance: P50 CPU {cpu_p50:.0%}, P50 memory {mem_p50:.0%}",
+                            metric.get("suggested_action", "Consider downsizing"),
+                            "Start by reducing worker count by 25-30%",
+                            "Monitor P90 CPU to ensure it stays below 85%",
+                        ],
+                        "insight": f"This cluster has significant headroom - {cpu_headroom:.0%} CPU and {mem_headroom:.0%} memory unused at P50/P95 respectively.",
+                        "effort": "30 minutes to implement, 1 week to validate",
+                    })
+        
+        return recs
+    
+    def _idle_clusters(self, utilization_data: Dict, cost_analysis: Dict) -> List[Dict]:
+        """Identify clusters that are running but essentially idle."""
+        recs = []
+        
+        if not utilization_data.get("available"):
+            return recs
+        
+        idle_clusters = utilization_data.get("idle_clusters", [])
+        if not idle_clusters:
+            return recs
+        
+        # Get average DBU price
+        total_cost = cost_analysis.get("total_cost", 0)
+        total_dbus = cost_analysis.get("total_dbus", 0)
+        avg_dbu_price = (total_cost / total_dbus) if total_dbus > 0 else 0.50
+        
+        total_wasted_dbus = sum(c.get("wasted_dbus_estimate", 0) for c in idle_clusters)
+        total_wasted_cost = total_wasted_dbus * avg_dbu_price
+        
+        if total_wasted_cost > 5:  # Only if meaningful savings
+            top_idle = idle_clusters[:5]
+            cluster_names = [f"  - {c.get('cluster_name', 'unknown')}: {c.get('avg_cpu_percent', 0):.1f}% avg CPU, {c.get('pct_time_idle', 0):.0f}% time idle" for c in top_idle]
+            
+            recs.append({
+                "id": "idle_clusters",
+                "title": f"🔴 Terminate {len(idle_clusters)} idle clusters (~${total_wasted_cost:.2f} wasted)",
+                "severity": "high",
+                "category": "cluster",
+                "description": f"Found {len(idle_clusters)} clusters that spend >50% of their runtime essentially idle (<5% CPU). These are likely forgotten development clusters or misconfigured jobs.",
+                "estimated_savings": round(total_wasted_cost * self.confidence_factor, 2),
+                "steps": [
+                    "Review these clusters immediately:",
+                ] + cluster_names[:3] + [
+                    "Terminate unused clusters",
+                    "Set aggressive auto-terminate (15-30 min) on interactive clusters",
+                    "Consider scheduled shutdown for development workspaces",
+                ],
+                "insight": "Idle clusters are the most obvious waste - you're paying for compute that's doing nothing. Even 'development' clusters should terminate when not in use.",
+                "effort": "15 minutes to review and terminate",
+            })
+        
+        return recs
+    
+    def _autoscale_issues(self, utilization_data: Dict, cost_analysis: Dict) -> List[Dict]:
+        """Identify autoscaling clusters that aren't scaling effectively."""
+        recs = []
+        
+        if not utilization_data.get("available"):
+            return recs
+        
+        autoscale = utilization_data.get("autoscale_analysis", {})
+        never_down = autoscale.get("never_scales_down", [])
+        never_up = autoscale.get("never_scales_up", [])
+        
+        # Get average DBU price
+        total_cost = cost_analysis.get("total_cost", 0)
+        total_dbus = cost_analysis.get("total_dbus", 0)
+        avg_dbu_price = (total_cost / total_dbus) if total_dbus > 0 else 0.50
+        
+        # Never scales down - wasting money
+        if never_down:
+            wasted_dbus = sum(c.get("wasted_dbus_estimate", 0) for c in never_down)
+            wasted_cost = wasted_dbus * avg_dbu_price
+            
+            if wasted_cost > 5:
+                cluster_examples = [f"  - {c.get('cluster_name')}: always at {c.get('avg_workers'):.0f}/{c.get('autoscale_max')} workers" for c in never_down[:3]]
+                
+                recs.append({
+                    "id": "autoscale_never_down",
+                    "title": f"⚙️ Fix {len(never_down)} autoscaling clusters that never scale down",
+                    "severity": "medium",
+                    "category": "cluster",
+                    "description": f"These clusters have autoscaling configured but always run at or near max capacity. Either workload is constant (use fixed size) or autoscaling isn't triggering properly.",
+                    "estimated_savings": round(wasted_cost * self.confidence_factor, 2),
+                    "steps": [
+                        "Clusters that never scale down:",
+                    ] + cluster_examples + [
+                        "Option 1: If workload is truly constant, switch to fixed-size cluster",
+                        "Option 2: Review autoscaling triggers - may need tuning",
+                        "Option 3: Check if cluster is oversized at min_workers",
+                    ],
+                    "insight": "Autoscaling that never scales down gives you the worst of both worlds: autoscaling overhead without the cost savings.",
+                    "effort": "30 minutes per cluster to analyze and adjust",
+                })
+        
+        # Never scales up - may indicate over-provisioning at min
+        if len(never_up) >= 2:
+            recs.append({
+                "id": "autoscale_never_up",
+                "title": f"⚙️ Review {len(never_up)} autoscaling clusters that never scale up",
+                "severity": "low",
+                "category": "cluster",
+                "description": f"These clusters have autoscaling configured but workload never triggers scale-up. Either min_workers is already sufficient or autoscaling triggers are misconfigured.",
+                "estimated_savings": 0,  # Not direct savings, but simplification
+                "steps": [
+                    "Consider these options:",
+                    "If workload fits in min_workers: reduce max_workers (simpler config)",
+                    "If jobs are slower than expected: check autoscaling triggers",
+                    "If this is intentional buffer: document and ignore",
+                ],
+                "insight": "Unused autoscaling capacity isn't directly wasteful, but it can indicate over-provisioned min_workers or misconfigured triggers.",
+                "effort": "15 minutes per cluster to review",
+            })
+        
+        return recs
+    
+    def _driver_worker_imbalance(self, utilization_data: Dict) -> List[Dict]:
+        """Identify clusters with driver/worker resource imbalance."""
+        recs = []
+        
+        if not utilization_data.get("available"):
+            return recs
+        
+        imbalanced = utilization_data.get("driver_imbalance", [])
+        
+        # Group by issue type
+        driver_cpu_bottleneck = [c for c in imbalanced if c.get("issue") == "driver_cpu_bottleneck"]
+        driver_mem_bottleneck = [c for c in imbalanced if c.get("issue") == "driver_memory_bottleneck"]
+        
+        if driver_cpu_bottleneck:
+            total_dbus = sum(c.get("total_dbus", 0) for c in driver_cpu_bottleneck)
+            examples = [f"  - {c.get('cluster_name')}: driver {c.get('driver_cpu_p90'):.0%} CPU vs workers {c.get('worker_cpu_p90'):.0%}" for c in driver_cpu_bottleneck[:3]]
+            
+            recs.append({
+                "id": "driver_cpu_bottleneck",
+                "title": f"🔧 Fix driver CPU bottleneck in {len(driver_cpu_bottleneck)} clusters",
+                "severity": "medium",
+                "category": "cluster",
+                "description": f"These clusters have high driver CPU while workers are underutilized. This usually indicates code that's doing too much work on the driver (collect(), pandas operations, etc.).",
+                "estimated_savings": round(total_dbus * 0.15 * 0.50, 2),  # 15% efficiency gain possible
+                "steps": [
+                    "Affected clusters:",
+                ] + examples + [
+                    "Common causes:",
+                    "1. Large collect() operations pulling data to driver",
+                    "2. Using toPandas() on large datasets",
+                    "3. Complex UDFs that serialize through driver",
+                    "Fix: Rewrite to keep processing distributed on workers",
+                ],
+                "insight": "When driver is maxed but workers are idle, you're paying for unused worker capacity. The bottleneck limits throughput regardless of worker count.",
+                "effort": "2-4 hours to refactor code patterns",
+            })
+        
+        if driver_mem_bottleneck:
+            examples = [f"  - {c.get('cluster_name')}: driver {c.get('driver_mem_p95'):.0%} memory vs workers {c.get('worker_mem_p95'):.0%}" for c in driver_mem_bottleneck[:3]]
+            
+            recs.append({
+                "id": "driver_memory_bottleneck",
+                "title": f"🔧 Fix driver memory pressure in {len(driver_mem_bottleneck)} clusters",
+                "severity": "high",  # Memory pressure can cause OOM
+                "category": "cluster",
+                "description": f"These clusters have high driver memory while workers have headroom. This risks OOM errors and indicates data is being collected to driver unnecessarily.",
+                "estimated_savings": 0,  # Reliability improvement, not cost
+                "steps": [
+                    "Affected clusters:",
+                ] + examples + [
+                    "Common causes:",
+                    "1. collect() on large datasets",
+                    "2. Broadcast joins with large tables",
+                    "3. Caching datasets on driver",
+                    "Fix: Use distributed writes (saveAsTable, write.parquet) instead of collecting",
+                ],
+                "insight": "Driver OOM is a common cause of job failures. Fixing this improves reliability and may allow using a smaller (cheaper) driver node.",
+                "effort": "1-3 hours to identify and fix collect patterns",
+            })
+        
+        return recs
+    
+    def _tagging_governance(self, usage_data: Dict) -> List[Dict]:
+        """Recommend proper tagging for cost attribution."""
+        recs = []
+        
+        tagging = usage_data.get("tagging_analysis", {})
+        untagged_pct = tagging.get("untagged_percentage", 0)
+        untagged_dbus = tagging.get("untagged_dbus", 0)
+        
+        if tagging.get("has_tagging_gap") and untagged_pct > 20:
+            # Estimate cost impact (rough: $0.50/DBU average)
+            untagged_cost_estimate = untagged_dbus * 0.50
+            
+            recs.append({
+                "id": "implement_tagging",
+                "title": f"🏷️ Implement resource tagging ({untagged_pct:.0f}% of spend is unattributed)",
+                "severity": "high" if untagged_pct > 50 else "medium",
+                "category": "governance",
+                "description": f"{untagged_pct:.0f}% of DBU usage has no custom tags, making it impossible to attribute costs to teams or projects. This hides waste.",
+                "estimated_savings": round(untagged_cost_estimate * 0.1 * self.confidence_factor, 2),
+                "steps": [
+                    "Define mandatory tags: team, project, environment (dev/prod)",
+                    "Update cluster policies to require tags on creation",
+                    "Add tags to existing clusters and jobs",
+                    "Set up cost allocation reports by tag",
+                ],
+                "insight": "Without tags, you can't answer 'which team is spending the most?' or 'what project is this cluster for?'. Tagging enables accountability.",
+                "effort": "1-2 hours to implement policy, ongoing enforcement",
+            })
+        
+        return recs
+    
+    def _weekend_waste(self, usage_data: Dict, cost_analysis: Dict) -> List[Dict]:
+        """Identify forgotten resources running on weekends."""
+        recs = []
+        
+        patterns = usage_data.get("usage_patterns", {})
+        weekend_dbus = patterns.get("weekend_dbus", 0)
+        weekend_ratio = patterns.get("weekend_to_weekday_ratio", 0)
+        total_cost = cost_analysis.get("total_cost", 0)
+        
+        if patterns.get("has_weekend_waste") and weekend_dbus > 10:
+            # Estimate weekend waste cost
+            weekend_pct = patterns.get("weekend_percentage", 0)
+            weekend_cost = total_cost * (weekend_pct / 100)
+            
+            # If weekend usage is >15% of weekday average, most is likely waste
+            # Assume 70% of weekend usage is "forgotten" resources
+            wasted_cost = weekend_cost * 0.7
+            
+            recs.append({
+                "id": "weekend_waste",
+                "title": f"📅 Reduce weekend/off-hours usage ({weekend_ratio:.0%} of weekday activity)",
+                "severity": "high" if wasted_cost > 50 else "medium",
+                "category": "governance",
+                "description": f"Significant compute runs on weekends ({weekend_pct:.1f}% of total). Unless you have scheduled batch jobs, this is likely forgotten notebooks or dev clusters.",
+                "estimated_savings": round(wasted_cost * self.confidence_factor, 2),
+                "steps": [
+                    "Audit: Check which clusters/notebooks ran last weekend",
+                    "Set auto-termination to 30 min or less on all interactive clusters",
+                    "For SQL warehouses: set auto-stop to 10 minutes",
+                    "Consider scheduled shutdown policies for non-production workspaces",
+                ],
+                "insight": f"If your team doesn't work weekends, weekend Databricks spend is usually waste. At {weekend_ratio:.0%} of weekday levels, ~${wasted_cost:.2f} may be recoverable.",
+                "effort": "30 minutes to audit, ongoing discipline",
+            })
+        
+        return recs
+    
+    def _delta_optimization(self, sql_analysis: Dict, cost_analysis: Dict) -> List[Dict]:
+        """Recommend Delta table optimizations based on query patterns."""
+        recs = []
+        
+        query_count = sql_analysis.get("query_count", 0)
+        pattern_summary = sql_analysis.get("pattern_summary", {})
+        large_scans = pattern_summary.get("large_result_sets", 0)
+        sql_cost = cost_analysis.get("cost_by_product", {}).get("SQL", {}).get("cost", 0)
+        
+        # If significant SQL spend and large data scans
+        if sql_cost > 10 and (large_scans > 5 or query_count > 100):
+            recs.append({
+                "id": "delta_optimization",
+                "title": "Consider Delta table optimization (Z-ordering, Liquid Clustering)",
+                "severity": "low",
+                "category": "data",
+                "description": f"With ${sql_cost:.2f} SQL spend and {query_count} queries, table optimization can significantly reduce scan costs.",
+                "estimated_savings": round(sql_cost * 0.15 * self.confidence_factor, 2),
+                "steps": [
+                    "Identify most-queried tables from Query History",
+                    "For existing tables: OPTIMIZE table ZORDER BY (common_filter_column)",
+                    "For new tables: Use Liquid Clustering (auto-manages data layout)",
+                    "Enable Predictive Optimization in SQL Warehouses for auto-OPTIMIZE",
+                ],
+                "insight": "Z-ordering co-locates related data, reducing scan size. A well-optimized table can run 10x faster on the same queries.",
+                "effort": "15 min per table to analyze and optimize",
             })
         
         return recs

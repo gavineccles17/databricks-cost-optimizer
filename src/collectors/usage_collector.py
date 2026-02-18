@@ -210,6 +210,10 @@ class UsageCollector:
         logger.info(f"Serverless: ${serverless_cost:.2f} ({serverless_dbus:.2f} DBUs), Classic: ${classic_cost:.2f} ({classic_dbus:.2f} DBUs)")
         logger.info(f"Cost by product: {cost_by_product}")
         
+        # Additional analysis: tagging and usage patterns
+        tagging_analysis = self._analyze_tagging(start_date, end_date)
+        usage_patterns = self._analyze_usage_patterns(start_date, end_date)
+        
         return {
             "period": {
                 "start": start_date.isoformat(),
@@ -229,5 +233,109 @@ class UsageCollector:
             "cost_by_job": cost_by_job,
             "cost_by_warehouse": cost_by_warehouse,
             "cost_by_user": cost_by_user,
+            "tagging_analysis": tagging_analysis,
+            "usage_patterns": usage_patterns,
             "raw_data": results,
         }
+    
+    def _analyze_tagging(self, start_date: datetime, end_date: datetime) -> Dict[str, Any]:
+        """Analyze cost attribution by custom tags - identify untagged spend."""
+        try:
+            query = f"""
+            SELECT
+                CASE 
+                    WHEN custom_tags IS NULL OR size(custom_tags) = 0 THEN 'untagged'
+                    ELSE 'tagged'
+                END as tag_status,
+                SUM(usage_quantity) as total_dbus,
+                COUNT(DISTINCT usage_metadata.cluster_id) as cluster_count,
+                COUNT(DISTINCT usage_metadata.job_id) as job_count
+            FROM system.billing.usage
+            WHERE usage_date BETWEEN '{start_date.date()}' AND '{end_date.date()}'
+            GROUP BY 1
+            """
+            results = self.client.execute_query(query)
+            
+            tagged_dbus = 0
+            untagged_dbus = 0
+            for row in results:
+                if row.get("tag_status") == "tagged":
+                    tagged_dbus = float(row.get("total_dbus", 0) or 0)
+                else:
+                    untagged_dbus = float(row.get("total_dbus", 0) or 0)
+            
+            total = tagged_dbus + untagged_dbus
+            untagged_pct = (untagged_dbus / total * 100) if total > 0 else 0
+            
+            logger.info(f"Tagging analysis: {untagged_pct:.1f}% untagged spend")
+            
+            return {
+                "tagged_dbus": tagged_dbus,
+                "untagged_dbus": untagged_dbus,
+                "untagged_percentage": round(untagged_pct, 1),
+                "has_tagging_gap": untagged_pct > 20,
+            }
+        except Exception as e:
+            logger.warning(f"Could not analyze tagging: {str(e)}")
+            return {"tagged_dbus": 0, "untagged_dbus": 0, "untagged_percentage": 0, "has_tagging_gap": False}
+    
+    def _analyze_usage_patterns(self, start_date: datetime, end_date: datetime) -> Dict[str, Any]:
+        """Analyze usage by day-of-week and hour to identify off-hours/weekend waste."""
+        try:
+            # Cost by day of week
+            dow_query = f"""
+            SELECT
+                DAYOFWEEK(usage_date) as day_of_week,
+                SUM(usage_quantity) as total_dbus
+            FROM system.billing.usage
+            WHERE usage_date BETWEEN '{start_date.date()}' AND '{end_date.date()}'
+            GROUP BY 1
+            ORDER BY 1
+            """
+            dow_results = self.client.execute_query(dow_query)
+            
+            # Day names (1=Sunday in Spark)
+            day_names = {1: "Sunday", 2: "Monday", 3: "Tuesday", 4: "Wednesday", 
+                        5: "Thursday", 6: "Friday", 7: "Saturday"}
+            
+            cost_by_day = {}
+            weekend_dbus = 0
+            weekday_dbus = 0
+            
+            for row in dow_results:
+                dow = row.get("day_of_week")
+                dbus = float(row.get("total_dbus", 0) or 0)
+                if dow:
+                    day_name = day_names.get(dow, f"Day {dow}")
+                    cost_by_day[day_name] = dbus
+                    if dow in (1, 7):  # Sunday or Saturday
+                        weekend_dbus += dbus
+                    else:
+                        weekday_dbus += dbus
+            
+            total = weekend_dbus + weekday_dbus
+            weekend_pct = (weekend_dbus / total * 100) if total > 0 else 0
+            
+            # Expected: 2/7 days = ~28.6% if uniform usage
+            # If weekend is >15% of weekday avg, it's likely forgotten clusters
+            weekday_avg = weekday_dbus / 5 if weekday_dbus > 0 else 0
+            weekend_avg = weekend_dbus / 2 if weekend_dbus > 0 else 0
+            weekend_ratio = weekend_avg / weekday_avg if weekday_avg > 0 else 0
+            
+            # "Forgotten" = weekend usage that's >15% of weekday average
+            has_weekend_waste = weekend_ratio > 0.15 and weekend_dbus > 10
+            
+            logger.info(f"Usage patterns: Weekend {weekend_pct:.1f}% of total, ratio {weekend_ratio:.2f}")
+            
+            return {
+                "cost_by_day": cost_by_day,
+                "weekend_dbus": weekend_dbus,
+                "weekday_dbus": weekday_dbus,
+                "weekend_percentage": round(weekend_pct, 1),
+                "weekend_to_weekday_ratio": round(weekend_ratio, 2),
+                "has_weekend_waste": has_weekend_waste,
+            }
+        except Exception as e:
+            logger.warning(f"Could not analyze usage patterns: {str(e)}")
+            return {"cost_by_day": {}, "weekend_dbus": 0, "weekday_dbus": 0, 
+                   "weekend_percentage": 0, "weekend_to_weekday_ratio": 0, "has_weekend_waste": False}
