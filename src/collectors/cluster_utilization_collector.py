@@ -132,16 +132,17 @@ class ClusterUtilizationCollector:
         ),
         
         cluster_info AS (
-            -- Get cluster metadata
+            -- Get cluster metadata (most recent config only)
             SELECT 
                 c.cluster_id,
                 COALESCE(c.cluster_name, 'Unknown') as cluster_name,
                 c.driver_node_type,
                 c.worker_node_type,
-                c.autoscale_min_workers,
-                c.autoscale_max_workers
+                c.min_autoscale_workers,
+                c.max_autoscale_workers
             FROM system.compute.clusters c
             JOIN target_clusters tc ON c.cluster_id = tc.cluster_id
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY c.cluster_id ORDER BY c.change_time DESC) = 1
         ),
         
         timeline_data AS (
@@ -197,8 +198,8 @@ class ClusterUtilizationCollector:
             tc.job_id,
             a.component,
             CASE WHEN a.component = 'driver' THEN ci.driver_node_type ELSE ci.worker_node_type END AS node_type,
-            ci.autoscale_min_workers,
-            ci.autoscale_max_workers,
+            ci.min_autoscale_workers,
+            ci.max_autoscale_workers,
             
             a.cpu_p25, a.cpu_p50, a.cpu_p75, a.cpu_p90, a.cpu_p99,
             a.mem_p25, a.mem_p50, a.mem_p75, a.mem_p90, a.mem_p95, a.mem_p99, a.mem_max,
@@ -293,8 +294,8 @@ class ClusterUtilizationCollector:
                 "component": row.get("component"),
                 "node_type": row.get("node_type"),
                 "total_dbus": float(row.get("total_dbus") or 0),
-                "autoscale_min": row.get("autoscale_min_workers"),
-                "autoscale_max": row.get("autoscale_max_workers"),
+                "autoscale_min": row.get("min_autoscale_workers"),
+                "autoscale_max": row.get("max_autoscale_workers"),
                 
                 # CPU metrics
                 "cpu_p25": float(row.get("cpu_p25") or 0),
@@ -518,12 +519,12 @@ class ClusterUtilizationCollector:
                 SELECT 
                     cluster_id,
                     cluster_name,
-                    autoscale_min_workers,
-                    autoscale_max_workers
+                    min_autoscale_workers,
+                    max_autoscale_workers
                 FROM system.compute.clusters
-                WHERE autoscale_min_workers IS NOT NULL
-                    AND autoscale_max_workers IS NOT NULL
-                    AND autoscale_max_workers > autoscale_min_workers
+                WHERE min_autoscale_workers IS NOT NULL
+                    AND max_autoscale_workers IS NOT NULL
+                    AND max_autoscale_workers > min_autoscale_workers
             ),
             worker_counts AS (
                 SELECT
@@ -541,8 +542,8 @@ class ClusterUtilizationCollector:
                 SELECT
                     wc.cluster_id,
                     ac.cluster_name,
-                    ac.autoscale_min_workers,
-                    ac.autoscale_max_workers,
+                    ac.min_autoscale_workers,
+                    ac.max_autoscale_workers,
                     AVG(wc.active_workers) as avg_workers,
                     MIN(wc.active_workers) as min_observed_workers,
                     MAX(wc.active_workers) as max_observed_workers,
@@ -550,7 +551,7 @@ class ClusterUtilizationCollector:
                     COUNT(*) as sample_hours
                 FROM worker_counts wc
                 JOIN autoscale_clusters ac ON wc.cluster_id = ac.cluster_id
-                GROUP BY wc.cluster_id, ac.cluster_name, ac.autoscale_min_workers, ac.autoscale_max_workers
+                GROUP BY wc.cluster_id, ac.cluster_name, ac.min_autoscale_workers, ac.max_autoscale_workers
                 HAVING COUNT(*) >= 10
             ),
             cluster_costs AS (
@@ -565,8 +566,8 @@ class ClusterUtilizationCollector:
             SELECT
                 cs.*,
                 COALESCE(cc.total_dbus, 0) as total_dbus,
-                ROUND((cs.avg_workers - cs.autoscale_min_workers) / 
-                      NULLIF(cs.autoscale_max_workers - cs.autoscale_min_workers, 0) * 100, 1) as scale_utilization_pct
+                ROUND((cs.avg_workers - cs.min_autoscale_workers) / 
+                      NULLIF(cs.max_autoscale_workers - cs.min_autoscale_workers, 0) * 100, 1) as scale_utilization_pct
             FROM cluster_scaling cs
             LEFT JOIN cluster_costs cc ON cs.cluster_id = cc.cluster_id
             ORDER BY cc.total_dbus DESC NULLS LAST
@@ -580,8 +581,8 @@ class ClusterUtilizationCollector:
             healthy_scaling = []
             
             for row in results:
-                min_workers = int(row.get("autoscale_min_workers") or 0)
-                max_workers = int(row.get("autoscale_max_workers") or 1)
+                min_workers = int(row.get("min_autoscale_workers") or 0)
+                max_workers = int(row.get("max_autoscale_workers") or 1)
                 avg_workers = float(row.get("avg_workers") or 0)
                 min_observed = int(row.get("min_observed_workers") or 0)
                 max_observed = int(row.get("max_observed_workers") or 0)

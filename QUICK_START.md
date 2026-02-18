@@ -2,6 +2,8 @@
 
 Get the Databricks Cost Optimizer running in under 5 minutes.
 
+> 📚 **See Also**: [System Tables Reference](SYSTEM_TABLES.md) for detailed information on data sources
+
 ## 1️⃣ Prerequisites
 
 - **Docker** installed ([download here](https://www.docker.com/products/docker-desktop))
@@ -101,12 +103,31 @@ docker-compose run --env MOCK_MODE=true --rm databricks-cost-optimizer
 
 The tool only needs **read-only** access. Your PAT token requires permissions to:
 
-- `system.billing.usage` → read
-- `system.compute.clusters` → read  
-- `system.compute.cluster_events` → read
-- `system.jobs.jobs` → read
-- `system.jobs.job_runs` → read
-- `system.query.history` → read
+### System Tables Accessed
+
+| System Table | Purpose |
+|--------------|----------|
+| `system.billing.usage` | Cost data, DBU consumption |
+| `system.compute.clusters` | Cluster metadata |
+| `system.compute.cluster_events` | Cluster lifecycle events |
+| `system.compute.node_timeline` | CPU/memory utilization |
+| `system.compute.warehouse_events` | SQL warehouse runtime |
+| `system.jobs.jobs` | Job metadata |
+| `system.jobs.job_runs` | Job execution history |
+| `system.query.history` | Query execution details |
+
+### Required Permissions
+
+```
+system.billing.usage → READ
+system.compute.clusters → READ
+system.compute.cluster_events → READ
+system.compute.node_timeline → READ
+system.compute.warehouse_events → READ
+system.jobs.jobs → READ
+system.jobs.job_runs → READ
+system.query.history → READ
+```
 
 **No create, modify, or delete permissions needed.**
 

@@ -49,3 +49,35 @@ def test_databricks_connection():
 if __name__ == "__main__":
     success = test_databricks_connection()
     sys.exit(0 if success else 1)
+
+
+def test_table_exists():
+    """Test the table_exists method."""
+    from src.databricks_client import DatabricksClient
+    
+    client = DatabricksClient(mock_mode=False)
+    
+    # Test common tables
+    print("\nTesting table existence checks:")
+    
+    tables_to_check = [
+        "system.billing.usage",
+        "system.billing.account_prices",
+        "system.billing.list_prices",
+        "system.compute.clusters",
+    ]
+    
+    for table in tables_to_check:
+        exists = client.table_exists(table)
+        status = "✅ EXISTS" if exists else "❌ NOT FOUND"
+        print(f"  {table}: {status}")
+    
+    client.close()
+    print("\n✅ Table existence checks completed")
+
+
+if __name__ == "__main__":
+    test_databricks_connection()
+    print("\n" + "=" * 60)
+    test_table_exists()
+    sys.exit(0 if success else 1)

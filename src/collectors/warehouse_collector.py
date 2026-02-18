@@ -88,8 +88,16 @@ class WarehouseCollector:
     
     def _collect_warehouse_costs(self, start_date: datetime, end_date: datetime) -> List[Dict]:
         """Get warehouse cost attribution from billing."""
-        # Try account_prices first, fallback to list_prices
-        costs = self._query_warehouse_costs_account_prices(start_date, end_date)
+        # Check if account_prices table exists before querying
+        has_account_prices = self.client.table_exists("system.billing.account_prices")
+        
+        if has_account_prices:
+            costs = self._query_warehouse_costs_account_prices(start_date, end_date)
+        else:
+            logger.info("account_prices table not available for warehouse costs, using list_prices")
+            costs = []
+        
+        # Fallback to list_prices if needed
         if not costs:
             costs = self._query_warehouse_costs_list_prices(start_date, end_date)
         return costs

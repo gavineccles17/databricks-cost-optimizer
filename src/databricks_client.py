@@ -38,6 +38,7 @@ class DatabricksClient:
         self.mock_mode = mock_mode
         self.config: Optional[DatabricksConnectionConfig] = None
         self.conn: Optional[sql.Connection] = None
+        self._table_exists_cache: Dict[str, bool] = {}  # Cache table existence checks
         
         if not mock_mode:
             self._load_config()
@@ -89,6 +90,44 @@ class DatabricksClient:
         except Exception as e:
             logger.error(f"Connection verification failed: {str(e)}")
             raise
+    
+    def table_exists(self, table_name: str) -> bool:
+        """
+        Check if a table exists in the workspace.
+        Results are cached to avoid repeated queries.
+        
+        Args:
+            table_name: Fully qualified table name (e.g., 'system.billing.account_prices')
+        
+        Returns:
+            True if table exists, False otherwise
+        """
+        # Check cache first
+        if table_name in self._table_exists_cache:
+            return self._table_exists_cache[table_name]
+        
+        if self.mock_mode:
+            # In mock mode, only account_prices might not exist
+            exists = table_name != "system.billing.account_prices"
+            self._table_exists_cache[table_name] = exists
+            return exists
+        
+        try:
+            # Try to query just 1 row to check existence
+            query = f"SELECT 1 FROM {table_name} LIMIT 1"
+            cursor = self.conn.cursor()
+            cursor.execute(query)
+            cursor.fetchone()
+            cursor.close()
+            
+            self._table_exists_cache[table_name] = True
+            logger.debug(f"Table {table_name} exists")
+            return True
+        except Exception as e:
+            # Table doesn't exist or no permissions
+            self._table_exists_cache[table_name] = False
+            logger.debug(f"Table {table_name} not accessible: {str(e)}")
+            return False
     
     def execute_query(self, query: str) -> List[Dict[str, Any]]:
         """

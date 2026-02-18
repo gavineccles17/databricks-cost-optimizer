@@ -37,10 +37,20 @@ class UsageCollector:
         """
         logger.info(f"Collecting usage data from {start_date.date()} to {end_date.date()}")
         
-        # Try account_prices first (contracted rates), fallback to list_prices
-        results = self._query_with_account_prices(start_date, end_date)
+        # Check if account_prices table exists before querying
+        has_account_prices = self.client.table_exists("system.billing.account_prices")
+        
+        if has_account_prices:
+            logger.info("Using account_prices for cost calculation (contracted rates)")
+            results = self._query_with_account_prices(start_date, end_date)
+        else:
+            logger.info("account_prices table not available, using list_prices (standard rates)")
+            results = []
+        
+        # Fallback to list_prices if account_prices query failed or not available
         if not results:
-            logger.info("account_prices not available, falling back to list_prices")
+            if has_account_prices:
+                logger.warning("account_prices query returned no results, falling back to list_prices")
             results = self._query_with_list_prices(start_date, end_date)
         
         logger.info(f"Usage query returned {len(results)} rows")
