@@ -9,9 +9,15 @@ logger = logging.getLogger(__name__)
 class RecommendationEngine:
     """Generates actionable infrastructure recommendations - focus on quick wins."""
     
-    def __init__(self, config: Dict[str, Any]):
-        """Initialize recommendation engine."""
+    def __init__(self, config: Dict[str, Any], workspace_url: str = ""):
+        """Initialize recommendation engine.
+        
+        Args:
+            config: Configuration dictionary
+            workspace_url: Databricks workspace URL for generating direct links
+        """
         self.config = config
+        self.workspace_url = workspace_url
         self.confidence_factor = config.get("confidence_factor", 0.75)
     
     def generate(
@@ -122,6 +128,7 @@ class RecommendationEngine:
                 cluster_name = issue.get("cluster_name", "Unknown")
                 cluster_id = issue.get("cluster_id", "unknown")
                 cluster_cost = issue.get("cost", 0)
+                cluster_owner = issue.get("cluster_owner", "")
                 
                 # Estimate 30-50% of cluster cost is idle time without auto-term
                 savings = cluster_cost * 0.4
@@ -131,8 +138,12 @@ class RecommendationEngine:
                     "title": f"🚨 Enable auto-terminate on cluster '{cluster_name}'",
                     "severity": "high",
                     "category": "cluster",
+                    "resource_id": cluster_id,
+                    "contact": cluster_owner if cluster_owner else "Contact cluster owner",
                     "description": f"Cluster '{cluster_name}' has NO auto-termination. Once started, it runs forever until manually stopped. This is the #1 cause of unexpected Databricks bills.",
                     "estimated_savings": round(savings * self.confidence_factor, 2),
+                    "before_config": "autotermination_minutes: null  # Never terminates",
+                    "after_config": "autotermination_minutes: 30  # Auto-terminate after 30min idle",
                     "steps": [
                         f"Go to Compute → Clusters → '{cluster_name}' → Edit",
                         "Under 'Autopilot Options', set 'Terminate after ___ minutes of inactivity'",
@@ -157,6 +168,10 @@ class RecommendationEngine:
             auto_stop = wh.get("auto_stop_minutes")
             total_cost = wh.get("total_cost", 0)
             
+            # Skip "Starter" warehouses (default/demo warehouses with minimal cost)
+            if "starter" in str(wh_name).lower() and total_cost < 1.0:
+                continue
+            
             if auto_stop is not None and auto_stop == 0 and total_cost > 0:
                 savings = total_cost * 0.3
                 recs.append({
@@ -164,8 +179,12 @@ class RecommendationEngine:
                     "title": f"🚨 Enable auto-stop on warehouse '{wh_name}'",
                     "severity": "high",
                     "category": "warehouse",
+                    "resource_id": wh_id,
+                    "contact": "Contact SQL warehouse admin",
                     "description": f"SQL Warehouse '{wh_name}' has auto-stop DISABLED. It charges continuously once started, even with zero queries running.",
                     "estimated_savings": round(savings * self.confidence_factor, 2),
+                    "before_config": "auto_stop_mins: 0  # Never stops",
+                    "after_config": "auto_stop_mins: 10  # Auto-stop after 10min idle",
                     "steps": [
                         f"Go to SQL Warehouses → '{wh_name}' → Edit",
                         "Set 'Auto stop' to 10-15 minutes",
@@ -207,6 +226,10 @@ class RecommendationEngine:
             wh_size = str(wh.get("warehouse_size", "")).upper()
             total_cost = wh.get("total_cost", 0)
             min_clusters = wh.get("min_clusters", 1)
+            
+            # Skip "Starter" warehouses (default/demo warehouses with minimal cost)
+            if "starter" in str(wh_name).lower() and total_cost < 1.0:
+                continue
             
             # Large warehouse sizes
             if wh_size in ["2X-LARGE", "3X-LARGE", "4X-LARGE"] and total_cost > 0:
@@ -264,6 +287,11 @@ class RecommendationEngine:
                 running_hours = wh.get("running_hours", 0)
                 if running_hours > 4:  # Only flag if >4 hours continuous
                     wh_name = wh.get("warehouse_name", "Unknown")
+                    
+                    # Skip "Starter" warehouses (default/demo warehouses)
+                    if "starter" in str(wh_name).lower():
+                        continue
+                    
                     cluster_count = wh.get("cluster_count", 1)
                     wh_size = wh.get("warehouse_size", "MEDIUM")
                     
@@ -315,6 +343,39 @@ class RecommendationEngine:
                         "insight": f"Each additional cluster doubles cost. If queries aren't queuing, you may not need {current_clusters} clusters.",
                         "effort": "5 minutes to review settings",
                     })
+        
+        # Idle warehouses (running but no queries)
+        idle_warehouses = warehouses_data.get("idle_warehouses", [])
+        for wh in idle_warehouses:
+            wh_name = wh.get("warehouse_name", "Unknown")
+            running_hours = wh.get("running_hours", 0)
+            wh_size = wh.get("warehouse_size", "MEDIUM")
+            
+            # Skip "Starter" warehouses (default/demo warehouses)
+            if "starter" in str(wh_name).lower():
+                continue
+            
+            # Rough hourly cost estimate by size
+            hourly_rates = {"SMALL": 2, "MEDIUM": 4, "LARGE": 8, "X-LARGE": 16, "2X-LARGE": 32}
+            base_rate = hourly_rates.get(str(wh_size).upper(), 4)
+            estimated_waste = running_hours * base_rate
+            
+            recs.append({
+                "id": f"wh_idle_{wh.get('warehouse_id', 'unknown')[:8]}",
+                "title": f"💤 Idle warehouse '{wh_name}' running {running_hours:.1f}h with no queries",
+                "severity": "high" if running_hours > 4 else "medium",
+                "category": "warehouse",
+                "description": f"Warehouse '{wh_name}' has been running for {running_hours:.1f} hours with no recent query activity. This is pure waste.",
+                "estimated_savings": round(estimated_waste * 0.7 * self.confidence_factor, 2),
+                "steps": [
+                    "Check Query History to confirm no active usage",
+                    f"Stop warehouse '{wh_name}' immediately if truly idle",
+                    "Verify auto-stop is configured (10-15 min recommended)",
+                    "Consider if this warehouse is needed at all",
+                ],
+                "insight": f"A {wh_size} warehouse running idle costs ~${base_rate}/hour. Shut it down now to stop bleeding money.",
+                "effort": "30 seconds to stop",
+            })
         
         return recs
     
@@ -449,24 +510,41 @@ class RecommendationEngine:
                 pass
         
         # For now, give general guidance on Photon
-        sql_cost = cost_by_product.get("SQL", {}).get("cost", 0)
+        sql_data = cost_by_product.get("SQL", {})
+        sql_cost = sql_data.get("cost", 0)
+        sql_serverless_cost = sql_data.get("serverless", 0)
+        sql_classic_cost = sql_data.get("classic", 0)
+        
+        # Only recommend for classic SQL (serverless already optimally uses Photon)
+        # If mostly serverless (>80%), don't recommend or give minimal savings
         if sql_cost > 5:
-            recs.append({
-                "id": "evaluate_photon",
-                "title": "Evaluate Photon - is the 2x cost worth it for your queries?",
-                "severity": "low",
-                "category": "compute",
-                "description": f"Photon accelerates SQL queries but costs ~2x more per DBU. It's worth it for CPU-bound queries, not for I/O-bound or simple queries.",
-                "estimated_savings": round(sql_cost * 0.3 * self.confidence_factor, 2),
-                "steps": [
-                    "Check warehouse settings: is Photon enabled?",
-                    "Photon helps: complex aggregations, joins, many transformations",
-                    "Photon DOESN'T help: simple SELECT, I/O-bound, already fast queries",
-                    "Test: Run same query with/without Photon, compare time × cost",
-                ],
-                "insight": "If Photon makes query 3x faster, it's worth 2x cost. If only 1.5x faster, you're losing money.",
-                "effort": "30 minutes to benchmark",
-            })
+            serverless_pct = (sql_serverless_cost / sql_cost * 100) if sql_cost > 0 else 0
+            
+            if serverless_pct < 80:  # Mostly classic SQL
+                # Classic SQL can potentially optimize Photon usage
+                estimated_savings = round(sql_classic_cost * 0.3 * self.confidence_factor, 2)
+            else:
+                # Mostly serverless - already optimal, very minimal savings potential
+                estimated_savings = round(sql_cost * 0.05 * self.confidence_factor, 2)
+            
+            # Only add recommendation if savings >= $1
+            if estimated_savings >= 1.0:
+                recs.append({
+                    "id": "evaluate_photon",
+                    "title": "Evaluate Photon - is the 2x cost worth it for your queries?",
+                    "severity": "low",
+                    "category": "compute",
+                    "description": f"Photon accelerates SQL queries but costs ~2x more per DBU. It's worth it for CPU-bound queries, not for I/O-bound or simple queries.",
+                    "estimated_savings": estimated_savings,
+                    "steps": [
+                        "Check warehouse settings: is Photon enabled?",
+                        "Photon helps: complex aggregations, joins, many transformations",
+                        "Photon DOESN'T help: simple SELECT, I/O-bound, already fast queries",
+                        "Test: Run same query with/without Photon, compare time × cost",
+                    ],
+                    "insight": "If Photon makes query 3x faster, it's worth 2x cost. If only 1.5x faster, you're losing money." + (" Note: Serverless SQL already uses Photon optimally." if serverless_pct >= 80 else ""),
+                    "effort": "30 minutes to benchmark",
+                })
         
         return recs
     
@@ -609,22 +687,52 @@ class RecommendationEngine:
         jobs = job_analysis.get("jobs", [])
         total_job_cost = sum(float(j.get("total_cost", 0) or 0) for j in jobs)
         
-        if total_job_cost > 0.5:
-            savings = total_job_cost * 0.6  # Spot is 60-90% cheaper
+        # Calculate spot vs on-demand breakdown
+        spot_cost = sum(float(j.get("spot_cost", 0) or 0) for j in jobs)
+        on_demand_cost = sum(float(j.get("on_demand_cost", 0) or 0) for j in jobs)
+        
+        # Only recommend if there's significant on-demand job cost
+        if on_demand_cost > 0.5:
+            spot_pct = (spot_cost / total_job_cost * 100) if total_job_cost > 0 else 0
+            savings = on_demand_cost * 0.6  # Spot is 60-90% cheaper
+            
+            # Adjust message based on current spot usage
+            if spot_pct > 80:
+                # Already mostly on spot, don't recommend
+                return recs
+            elif spot_pct > 50:
+                description = f"Job compute costs ${total_job_cost:.2f} ({spot_pct:.0f}% already on spot). Remaining ${on_demand_cost:.2f} on-demand jobs could benefit from spot instances (60-90% cheaper)."
+                title = f"Switch remaining on-demand job clusters to spot (up to 70% cheaper)"
+            elif spot_pct > 0:
+                description = f"Job compute costs ${total_job_cost:.2f} ({spot_pct:.0f}% on spot, ${on_demand_cost:.2f} on-demand). Spot instances cost 60-90% less. Jobs can retry on spot preemption."
+                title = f"Use spot instances for more job clusters (up to 70% cheaper)"
+            else:
+                description = f"Job compute costs ${total_job_cost:.2f} (all on-demand). Spot instances cost 60-90% less than on-demand. Jobs can retry on spot preemption."
+                title = f"Use spot instances for job clusters (up to 70% cheaper)"
+            
             recs.append({
                 "id": "use_spot_instances",
-                "title": f"Use spot instances for job clusters (up to 70% cheaper)",
+                "title": title,
                 "severity": "medium",
                 "category": "compute",
-                "description": f"Job compute costs ${total_job_cost:.2f}. Spot instances cost 60-90% less than on-demand. Jobs can retry on spot preemption.",
+                "description": description,
                 "estimated_savings": round(savings * self.confidence_factor, 2),
+                "before_config": """# Current (On-demand):
+aws_attributes:
+  availability: ON_DEMAND
+  # Paying full price""",
+                "after_config": """# Spot instances (60-90% cheaper):
+aws_attributes:
+  availability: SPOT
+  zone_id: auto  # Let Databricks find available spot
+spot_bid_price_percent: 100  # Max bid price""",
                 "steps": [
                     "Edit job → Compute → Advanced → 'Use spot instances'",
                     "Or: in cluster config, set 'Spot/Preemptible' for worker nodes",
                     "Keep driver node on-demand for stability",
                     "Best for: batch jobs, ETL, jobs that can retry if interrupted",
                 ],
-                "insight": "Spot instances: same hardware, 60-90% cheaper. Databricks handles retries automatically if spot is reclaimed.",
+                "insight": f"Spot instances: same hardware, 60-90% cheaper. Databricks handles retries automatically if spot is reclaimed. Current spot usage: {spot_pct:.0f}%",
                 "effort": "2 minutes per job",
             })
         
@@ -863,6 +971,14 @@ class RecommendationEngine:
                 "category": "cluster",
                 "description": f"{over_provisioned_count} clusters show consistently low CPU/memory utilization (P50 CPU <40%, P50 memory <70%), indicating over-provisioning. Combined DBU spend: {over_provisioned_dbus:,.0f} DBUs.",
                 "estimated_savings": round(estimated_savings * self.confidence_factor, 2),
+                "before_config": """# Current (Fixed, over-provisioned):
+num_workers: 10
+node_type_id: i3.2xlarge  # 8 cores, 61GB RAM""",
+                "after_config": """# Optimized (Autoscaling, right-sized):
+autoscale:
+  min_workers: 2
+  max_workers: 6
+node_type_id: i3.xlarge  # 4 cores, 30.5GB RAM""",
                 "steps": steps,
                 "insight": f"These clusters spend <5% of time above 80% CPU utilization, meaning they're rarely under load. ~25% cost reduction is achievable by downsizing.",
                 "effort": "1-2 hours per cluster to analyze and adjust",

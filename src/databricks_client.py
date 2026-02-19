@@ -74,6 +74,16 @@ class DatabricksClient:
             logger.error(f"Failed to connect to Databricks: {str(e)}")
             raise
     
+    def get_workspace_url(self) -> str:
+        """Get the Databricks workspace URL for generating direct links."""
+        if self.mock_mode:
+            return "https://adb-123456789.azuredatabricks.net"
+        if self.config:
+            # Remove 'https://' prefix if present
+            host = self.config.host.replace('https://', '')
+            return f"https://{host}"
+        return ""
+    
     def verify_connection(self) -> bool:
         """Verify connection to Databricks is working."""
         if self.mock_mode:

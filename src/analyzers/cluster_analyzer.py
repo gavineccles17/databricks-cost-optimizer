@@ -64,6 +64,7 @@ class ClusterAnalyzer:
             
             cost_info = cost_by_cluster.get(cluster_id, {})
             cluster_cost = cost_info.get("total_cost", 0)
+            cluster_owner = cost_info.get("owner", "") or cluster.get("owned_by", "")
             
             # Check for missing auto-termination
             auto_termination_minutes = cluster.get("auto_termination_minutes")
@@ -73,6 +74,7 @@ class ClusterAnalyzer:
                         "type": "no_autotermination",
                         "cluster_id": cluster_id,
                         "cluster_name": cluster_name,
+                        "cluster_owner": cluster_owner,
                         "severity": "high",
                         "description": "Cluster has no auto-termination configured - will run indefinitely",
                         "cost": cluster_cost,

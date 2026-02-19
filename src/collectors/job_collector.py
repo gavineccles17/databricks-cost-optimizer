@@ -55,6 +55,25 @@ class JobCollector:
                 ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id ORDER BY change_time DESC) as rn
             FROM system.lakeflow.jobs 
             QUALIFY rn = 1
+        ),
+        job_clusters AS (
+            SELECT 
+                cluster_id,
+                cluster_name,
+                COALESCE(
+                    aws_attributes.availability,
+                    azure_attributes.availability,
+                    gcp_attributes.availability
+                ) as availability,
+                CASE
+                    WHEN aws_attributes.availability IN ('SPOT', 'SPOT_WITH_FALLBACK') THEN true
+                    WHEN azure_attributes.availability IN ('SPOT_AZURE', 'SPOT_WITH_FALLBACK_AZURE') THEN true
+                    WHEN gcp_attributes.availability IN ('PREEMPTIBLE_GCP', 'PREEMPTIBLE_WITH_FALLBACK_GCP') THEN true
+                    ELSE false
+                END as uses_spot
+            FROM system.compute.clusters
+            WHERE cluster_name RLIKE '^job-[0-9]+-run-[0-9]+'
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) = 1
         )
         SELECT
             usage.usage_metadata.job_id as job_id,
@@ -62,8 +81,11 @@ class JobCollector:
             jobs.creator_user_name as owner,
             usage.sku_name,
             usage.product_features.is_serverless as is_serverless,
+            MAX(jc.uses_spot) as uses_spot,
             SUM(usage.usage_quantity) as total_dbus,
             SUM(usage.usage_quantity * lp.pricing.effective_list.default) as total_cost,
+            SUM(CASE WHEN jc.uses_spot = true THEN usage.usage_quantity * lp.pricing.effective_list.default ELSE 0 END) as spot_cost,
+            SUM(CASE WHEN jc.uses_spot = false OR jc.uses_spot IS NULL THEN usage.usage_quantity * lp.pricing.effective_list.default ELSE 0 END) as on_demand_cost,
             COUNT(DISTINCT usage.usage_metadata.job_run_id) as run_count,
             MIN(usage.usage_start_time) as first_run,
             MAX(usage.usage_end_time) as last_run
@@ -71,6 +93,7 @@ class JobCollector:
         JOIN system.billing.list_prices lp ON lp.sku_name = usage.sku_name
         LEFT JOIN jobs ON usage.workspace_id = jobs.workspace_id 
             AND usage.usage_metadata.job_id = jobs.job_id
+        LEFT JOIN job_clusters jc ON usage.usage_metadata.cluster_id = jc.cluster_id
         WHERE usage.usage_metadata.job_id IS NOT NULL
             AND usage.usage_end_time >= lp.price_start_time
             AND (lp.price_end_time IS NULL OR usage.usage_end_time < lp.price_end_time)
@@ -96,8 +119,50 @@ class JobCollector:
         """Fallback query without system.lakeflow.jobs join."""
         try:
             fallback_query = f"""
+            WITH job_clusters AS (
+                SELECT 
+                    cluster_id,
+                    cluster_name,
+                    COALESCE(
+                        aws_attributes.availability,
+                        azure_attributes.availability,
+                        gcp_attributes.availability
+                    ) as availability,
+                    CASE
+                        WHEN aws_attributes.availability IN ('SPOT', 'SPOT_WITH_FALLBACK') THEN true
+                        WHEN azure_attributes.availability IN ('SPOT_AZURE', 'SPOT_WITH_FALLBACK_AZURE') THEN true
+                        WHEN gcp_attributes.availability IN ('PREEMPTIBLE_GCP', 'PREEMPTIBLE_WITH_FALLBACK_GCP') THEN true
+                        ELSE false
+                    END as uses_spot
+                FROM system.compute.clusters
+                WHERE cluster_name RLIKE '^job-[0-9]+-run-[0-9]+'
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) = 1
+            )
             SELECT
                 usage.usage_metadata.job_id as job_id,
+                usage.usage_metadata.job_name as job_name,
+                NULL as owner,
+                usage.sku_name,
+                usage.product_features.is_serverless as is_serverless,
+                MAX(jc.uses_spot) as uses_spot,
+                SUM(usage.usage_quantity) as total_dbus,
+                SUM(usage.usage_quantity * lp.pricing.effective_list.default) as total_cost,
+                SUM(CASE WHEN jc.uses_spot = true THEN usage.usage_quantity * lp.pricing.effective_list.default ELSE 0 END) as spot_cost,
+                SUM(CASE WHEN jc.uses_spot = false OR jc.uses_spot IS NULL THEN usage.usage_quantity * lp.pricing.effective_list.default ELSE 0 END) as on_demand_cost,
+                COUNT(DISTINCT usage.usage_metadata.job_run_id) as run_count,
+                MIN(usage.usage_start_time) as first_run,
+                MAX(usage.usage_end_time) as last_run
+            FROM system.billing.usage usage
+            JOIN system.billing.list_prices lp ON lp.sku_name = usage.sku_name
+            LEFT JOIN job_clusters jc ON usage.usage_metadata.cluster_id = jc.cluster_id
+            WHERE usage.usage_metadata.job_id IS NOT NULL
+                AND usage.usage_end_time >= lp.price_start_time
+                AND (lp.price_end_time IS NULL OR usage.usage_end_time < lp.price_end_time)
+                AND usage.usage_date BETWEEN '{start_date.date()}' AND '{end_date.date()}'
+            GROUP BY 1, 2, 3, 4, 5
+            ORDER BY total_cost DESC
+            LIMIT 100
+            """
                 usage.usage_metadata.job_name as job_name,
                 NULL as owner,
                 usage.sku_name,

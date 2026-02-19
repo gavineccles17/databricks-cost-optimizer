@@ -129,7 +129,8 @@ def main(
         
         # ============ RECOMMENDATION ENGINE ============
         logger.info("Generating recommendations...")
-        rec_engine = RecommendationEngine(config)
+        workspace_url = db_client.get_workspace_url()
+        rec_engine = RecommendationEngine(config, workspace_url=workspace_url)
         recommendations = rec_engine.generate(
             cost_analysis, cluster_analysis, job_analysis, sql_analysis, 
             warehouses_data, usage_data, utilization_data, queries_data
@@ -140,7 +141,7 @@ def main(
         output_dir.mkdir(parents=True, exist_ok=True)
         
         logger.info("Generating Markdown report...")
-        md_report = MarkdownReport(config)
+        md_report = MarkdownReport(config, workspace_url=workspace_url)
         md_path = md_report.generate(
             output_dir,
             cost_analysis,

@@ -42,6 +42,7 @@ class WarehouseCollector:
         # Detect long-running and upscaled warehouses
         long_running = self._detect_long_running_warehouses()
         upscaled_too_long = self._detect_upscaled_warehouses()
+        idle_warehouses = self._detect_idle_warehouses(start_date, end_date)
         
         # Merge costs with warehouse configs
         warehouses_with_costs = self._merge_warehouse_data(warehouses, warehouse_costs)
@@ -57,6 +58,7 @@ class WarehouseCollector:
             "issue_count": len(issues),
             "long_running_warehouses": long_running,
             "upscaled_warehouses": upscaled_too_long,
+            "idle_warehouses": idle_warehouses,
             "period": {
                 "start": start_date.isoformat(),
                 "end": end_date.isoformat(),
@@ -399,4 +401,74 @@ class WarehouseCollector:
             
         except Exception as e:
             logger.warning(f"Could not detect upscaled warehouses: {str(e)}")
+            return []    
+    def _detect_idle_warehouses(self, start_date: datetime, end_date: datetime) -> List[Dict]:
+        """
+        Detect warehouses that are running but have no query activity.
+        Identifies waste from warehouses left running with no usage.
+        """
+        try:
+            query = f"""
+            WITH running_warehouses AS (
+                SELECT DISTINCT
+                    we.warehouse_id,
+                    w.warehouse_name,
+                    w.warehouse_size,
+                    we.event_time,
+                    TIMESTAMPDIFF(MINUTE, we.event_time, CURRENT_TIMESTAMP()) / 60.0 AS running_hours
+                FROM system.compute.warehouse_events we
+                LEFT JOIN system.compute.warehouses w ON we.warehouse_id = w.warehouse_id
+                WHERE we.event_type = 'RUNNING'
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM system.compute.warehouse_events we2
+                        WHERE we2.warehouse_id = we.warehouse_id
+                        AND we2.event_time > we.event_time
+                    )
+                    AND TIMESTAMPDIFF(MINUTE, we.event_time, CURRENT_TIMESTAMP()) > 30
+            ),
+            query_activity AS (
+                SELECT
+                    warehouse_id,
+                    COUNT(*) as query_count,
+                    MAX(end_time) as last_query_time
+                FROM system.query.history
+                WHERE start_time >= CURRENT_DATE() - INTERVAL 1 DAY
+                GROUP BY warehouse_id
+            )
+            SELECT
+                rw.warehouse_id,
+                rw.warehouse_name,
+                rw.warehouse_size,
+                rw.running_hours,
+                COALESCE(qa.query_count, 0) as recent_query_count,
+                qa.last_query_time
+            FROM running_warehouses rw
+            LEFT JOIN query_activity qa ON rw.warehouse_id = qa.warehouse_id
+            WHERE COALESCE(qa.query_count, 0) = 0
+                OR TIMESTAMPDIFF(HOUR, qa.last_query_time, CURRENT_TIMESTAMP()) > 2
+            ORDER BY rw.running_hours DESC
+            """
+            
+            results = self.client.execute_query(query)
+            
+            idle = []
+            for row in results:
+                running_hours = float(row.get("running_hours") or 0)
+                query_count = int(row.get("recent_query_count") or 0)
+                
+                idle.append({
+                    "warehouse_id": row.get("warehouse_id"),
+                    "warehouse_name": row.get("warehouse_name") or "Unknown",
+                    "warehouse_size": row.get("warehouse_size"),
+                    "running_hours": round(running_hours, 2),
+                    "recent_query_count": query_count,
+                    "last_query_time": str(row.get("last_query_time")) if row.get("last_query_time") else "None",
+                })
+            
+            logger.info(f"Found {len(idle)} idle warehouses (running with no recent queries)")
+            return idle
+            
+        except Exception as e:
+            logger.warning(f"Could not detect idle warehouses: {str(e)}")
             return []

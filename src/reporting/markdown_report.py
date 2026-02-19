@@ -11,9 +11,15 @@ logger = logging.getLogger(__name__)
 class MarkdownReport:
     """Generates professional Markdown reports."""
     
-    def __init__(self, config: Dict[str, Any]):
-        """Initialize markdown report generator."""
+    def __init__(self, config: Dict[str, Any], workspace_url: str = ""):
+        """Initialize markdown report generator.
+        
+        Args:
+            config: Configuration dictionary
+            workspace_url: Databricks workspace URL for generating direct links
+        """
         self.config = config
+        self.workspace_url = workspace_url
     
     def _estimate_timeline(self, recommendations: List[Dict[str, Any]]) -> str:
         """Estimate implementation timeline based on recommendation severity."""
@@ -54,6 +60,70 @@ class MarkdownReport:
             return text
         # Leave room for ellipsis
         return text[:max_length-3] + "..."
+    
+    def _calculate_savings_grade(self, savings_percentage: float) -> str:
+        \"\"\"Calculate savings score grade (A-F).
+        
+        Based on percentage of current cost that can be saved.
+        Higher percentage = worse current efficiency but more opportunity.
+        \"\"\"
+        if savings_percentage >= 40:
+            return "F"  # Very poor efficiency
+        elif savings_percentage >= 30:
+            return "D"  # Poor efficiency
+        elif savings_percentage >= 20:
+            return "C"  # Below average efficiency
+        elif savings_percentage >= 10:
+            return "B"  # Good efficiency
+        else:
+            return "A"  # Excellent efficiency
+    
+    def _effort_to_minutes(self, effort_str: str) -> float:
+        \"\"\"Convert effort string to minutes for ratio calculation.\"\"\"
+        effort_str = str(effort_str).lower()
+        if "second" in effort_str:
+            # Extract number before 'second'
+            parts = effort_str.split()
+            for i, part in enumerate(parts):
+                if "second" in part and i > 0:
+                    try:
+                        return float(parts[i-1]) / 60  # Convert to minutes
+                    except:
+                        return 0.5
+            return 0.5  # Default 30 seconds
+        elif "minute" in effort_str:
+            parts = effort_str.split()
+            for i, part in enumerate(parts):
+                if "minute" in part and i > 0:
+                    try:
+                        return float(parts[i-1])
+                    except:
+                        return 2
+            return 2  # Default 2 minutes
+        elif "hour" in effort_str:
+            parts = effort_str.split()
+            for i, part in enumerate(parts):
+                if "hour" in part and i > 0:
+                    try:
+                        return float(parts[i-1]) * 60
+                    except:
+                        return 120
+            return 120  # Default 2 hours
+        return 30  # Default 30 minutes
+    
+    def _generate_resource_url(self, resource_type: str, resource_id: str) -> str:
+        \"\"\"Generate direct Databricks URL for a resource.\"\"\"
+        if not self.workspace_url or not resource_id:
+            return \"\"
+        
+        url_templates = {
+            \"cluster\": f\"{self.workspace_url}/#setting/clusters/{resource_id}\",
+            \"job\": f\"{self.workspace_url}/#job/{resource_id}\",
+            \"warehouse\": f\"{self.workspace_url}/sql/warehouses/{resource_id}\",
+            \"query\": f\"{self.workspace_url}/sql/editor/{resource_id}\",
+        }
+        
+        return url_templates.get(resource_type, \"\")
     
     def _benchmark_assessment(self, waste_percentage: float) -> str:
         """Assess how the company's waste compares to industry benchmark."""
@@ -187,38 +257,75 @@ class MarkdownReport:
                 lines.append(f"> 💰 **Potential Savings**: ~25% reduction on over-provisioned clusters could save ~${potential_savings:,.2f}/month")
                 lines.append("")
         
-        # Get worker metrics only for display (more impactful)
-        worker_metrics = [m for m in cluster_metrics if m.get("component") == "worker"][:10]
+        # Separate sections for over-provisioned and under-provisioned clusters
+        over_provisioned = [m for m in cluster_metrics if m.get("component") == "worker" and m.get("overall_status") == "over-provisioned"]
+        under_provisioned = [m for m in cluster_metrics if m.get("component") == "worker" and m.get("overall_status") == "under-provisioned"]
+        right_sized = [m for m in cluster_metrics if m.get("component") == "worker" and m.get("overall_status") == "right-sized"]
         
-        if worker_metrics:
+        # Show over-provisioned clusters first (quick wins)
+        if over_provisioned:
             lines.extend([
-                "### Top Clusters by DBU Spend (Worker Nodes)",
+                "### ⬇️ Over-Provisioned Clusters (Downsize for Savings)",
                 "",
-                "| Cluster | DBUs | CPU P50 | CPU P90 | Mem P50 | Mem P95 | Status | Action |",
-                "|---------|------|---------|---------|---------|---------|--------|--------|",
+                "These clusters are running below optimal utilization - consider downsizing:",
+                "",
+                "| Cluster | DBUs | CPU P50 | CPU P90 | Mem P50 | Mem P95 | Action |",
+                "|---------|------|---------|---------|---------|---------|--------|",
             ])
-            
-            for m in worker_metrics:
+            for m in over_provisioned[:10]:
                 name = self._truncate_text(m.get("cluster_name", m.get("cluster_id", "unknown")), 50)
                 dbus = m.get("total_dbus", 0)
                 cpu_p50 = m.get("cpu_p50", 0)
                 cpu_p90 = m.get("cpu_p90", 0)
                 mem_p50 = m.get("mem_p50", 0)
                 mem_p95 = m.get("mem_p95", 0)
-                status = m.get("overall_status", "unknown")
                 action = self._truncate_text(m.get("suggested_action", ""), 80)
-                
-                # Status emoji
-                if status == "over-provisioned":
-                    status_display = "⬇️ Over"
-                elif status == "under-provisioned":
-                    status_display = "⬆️ Under"
-                else:
-                    status_display = "✅ OK"
-                
-                lines.append(f"| {name} | {dbus:,.0f} | {cpu_p50:.0%} | {cpu_p90:.0%} | {mem_p50:.0%} | {mem_p95:.0%} | {status_display} | {action} |")
-            
+                lines.append(f"| {name} | {dbus:,.0f} | {cpu_p50:.0%} | {cpu_p90:.0%} | {mem_p50:.0%} | {mem_p95:.0%} | {action} |")
             lines.append("")
+        
+        # Show under-provisioned clusters (performance issues)
+        if under_provisioned:
+            lines.extend([
+                "### ⬆️ Under-Provisioned Clusters (Upsize for Performance)",
+                "",
+                "These clusters are running hot - consider upsizing to avoid slowdowns:",
+                "",
+                "| Cluster | DBUs | CPU P50 | CPU P90 | Mem P50 | Mem P95 | Action |",
+                "|---------|------|---------|---------|---------|---------|--------|",
+            ])
+            for m in under_provisioned[:10]:
+                name = self._truncate_text(m.get("cluster_name", m.get("cluster_id", "unknown")), 50)
+                dbus = m.get("total_dbus", 0)
+                cpu_p50 = m.get("cpu_p50", 0)
+                cpu_p90 = m.get("cpu_p90", 0)
+                mem_p50 = m.get("mem_p50", 0)
+                mem_p95 = m.get("mem_p95", 0)
+                action = self._truncate_text(m.get("suggested_action", ""), 80)
+                lines.append(f"| {name} | {dbus:,.0f} | {cpu_p50:.0%} | {cpu_p90:.0%} | {mem_p50:.0%} | {mem_p95:.0%} | {action} |")
+            lines.append("")
+        
+        # Show right-sized clusters (all good)
+        if right_sized and len(right_sized) <= 5:
+            lines.extend([
+                "### ✅ Right-Sized Clusters (No Action Needed)",
+                "",
+                "These clusters are properly sized:",
+                "",
+                "| Cluster | DBUs | CPU P50 | CPU P90 | Mem P50 | Mem P95 |",
+                "|---------|------|---------|---------|---------|---------|",
+            ])
+            for m in right_sized[:5]:
+                name = self._truncate_text(m.get("cluster_name", m.get("cluster_id", "unknown")), 50)
+                dbus = m.get("total_dbus", 0)
+                cpu_p50 = m.get("cpu_p50", 0)
+                cpu_p90 = m.get("cpu_p90", 0)
+                mem_p50 = m.get("mem_p50", 0)
+                mem_p95 = m.get("mem_p95", 0)
+                lines.append(f"| {name} | {dbus:,.0f} | {cpu_p50:.0%} | {cpu_p90:.0%} | {mem_p50:.0%} | {mem_p95:.0%} |")
+            lines.append("")
+        
+        # Add explanation of metrics
+        if over_provisioned or under_provisioned:
             lines.extend([
                 "**Key Metrics Explained:**",
                 "- **CPU P50/P90**: Median and 90th percentile CPU utilization",
@@ -371,15 +478,55 @@ class MarkdownReport:
         monthly_cost = cost_analysis.get("estimated_monthly_cost", 0)
         total_dbus = cost_analysis.get("total_dbus", 0)
         period_days = cost_analysis.get("period_days", 30)
-        total_savings = sum(r.get("estimated_savings", 0) for r in recommendations)
+        
+        # Calculate total savings but cap at monthly cost to prevent negative optimized path
+        raw_total_savings = sum(r.get("estimated_savings", 0) for r in recommendations)
+        total_savings = min(raw_total_savings, monthly_cost * 0.95)  # Cap at 95% to keep minimum $0 floor
+        
+        # If savings were capped, add a note
+        savings_capped = raw_total_savings > total_savings
+        
         annual_savings = total_savings * 12
         annual_spend = monthly_cost * 12
         savings_percentage = (total_savings / monthly_cost * 100) if monthly_cost > 0 else 0
+        
+        # Calculate savings grade
+        savings_grade = self._calculate_savings_grade(savings_percentage)
+        
+        # Calculate "do nothing" cost
+        do_nothing_annual = annual_spend
+        
+        # Get top 3 recommendations for TL;DR
+        top_3_recs = recommendations[:3] if len(recommendations) >= 3 else recommendations
         
         lines = [
             "# Databricks Cost & Performance Optimization Report",
             "",
             f"*Generated: {timestamp}*",
+            "",
+            "---",
+            "",
+            "## 📋 Executive TL;DR (Hand This to Your Manager)",
+            "",
+            "**5-Line Summary:**",
+            "",
+            f"1. 💰 **Current Spend**: ${monthly_cost:,.0f}/month (${annual_spend:,.0f}/year run rate)",
+            f"2. 🎯 **Savings Potential**: ${total_savings:,.0f}/month (${annual_savings:,.0f}/year) - **{savings_percentage:.0f}%** reduction",
+            f"3. 📊 **Cost Efficiency Grade**: **{savings_grade}** - " + ("Excellent!" if savings_grade == "A" else "Room for improvement" if savings_grade in ["B", "C"] else "Significant waste"),
+            f"4. ⚠️ **Do Nothing Cost**: If no action is taken, you will spend **${do_nothing_annual:,.0f}** over the next 12 months",
+            f"5. ⚡ **Top Action**: {top_3_recs[0].get('title', 'See recommendations below') if top_3_recs else 'No high-priority items'}",
+            "",
+            "**Top 3 Immediate Actions:**",
+        ]
+        
+        for i, rec in enumerate(top_3_recs, 1):
+            rec_title = rec.get('title', '').replace('🚨 ', '').replace('💰 ', '').replace('🔧 ', '')
+            rec_savings = rec.get('estimated_savings', 0)
+            lines.append(f"{i}. {rec_title} → **${rec_savings:,.0f}/month**")
+        
+        lines.extend([
+            "",
+            "---",
             "",
             "## Executive Summary",
             "",
@@ -389,8 +536,15 @@ class MarkdownReport:
             f"- **Annual Run Rate**: ${annual_spend:,.2f}",
             f"- **Potential Monthly Savings**: ${total_savings:,.2f}",
             f"- **Potential Annual Savings**: ${annual_savings:,.2f}",
+            f"- **Cost Efficiency Grade**: **{savings_grade}** ({savings_percentage:.1f}% optimization potential)",
             f"- **Optimization Opportunities**: {len(recommendations)}",
             f"- **Savings Potential**: {savings_percentage:.1f}% of current spend",
+        ]
+        
+        if savings_capped:
+            lines.append(f"- **Note**: Actual recommended savings exceed monthly cost; capped at 95% for realistic projections")
+        
+        lines.extend([
             "",
             "## Business Impact",
             "",
@@ -425,7 +579,7 @@ class MarkdownReport:
         
         for month in range(1, 13):
             current = monthly_cost * month
-            optimized = (monthly_cost - total_savings) * month
+            optimized = max((monthly_cost - total_savings) * month, 0)  # Ensure never negative
             savings = total_savings * month
             lines.append(f"| {month} | ${current:,.0f} | ${optimized:,.0f} | ${savings:,.0f} |")
         
@@ -504,35 +658,58 @@ class MarkdownReport:
         
         lines.append("")
         
-        # Top cost drivers - Clusters
+        # Top cost drivers - Clusters (exclude job clusters - those are ephemeral)
         top_clusters = cost_analysis.get("top_clusters", [])
-        if top_clusters:
+        # Filter out job clusters (cluster names like "job-123-run-456-...")
+        interactive_clusters = [
+            c for c in top_clusters 
+            if not (str(c.get('name', '')).startswith('job-') and '-run-' in str(c.get('name', '')))
+        ]
+        if interactive_clusters:
             lines.extend([
                 "",
-                "## Top Cost Drivers - Clusters",
+                "## Top Cost Drivers - Interactive Clusters",
+                "",
+                "*Note: Job clusters are shown in the Jobs section below*",
                 "",
                 "| Cluster | Name | DBUs | Cost |",
-                "|---------|------|------|------|",
+                "|---------|------|------|------|" ,
             ])
-            for cluster in top_clusters[:5]:
+            for cluster in interactive_clusters[:5]:
                 cluster_id = self._truncate_text(cluster.get('id', 'N/A'), 30)
                 cluster_name = cluster.get('name') or 'N/A'
                 lines.append(f"| {cluster_id} | {self._truncate_text(str(cluster_name), 50)} | {cluster.get('dbus', 0):,.2f} | ${cluster.get('cost', 0):,.2f} |")
         
-        # Top cost drivers - Jobs
+        # Top cost drivers - Jobs (with run details from job_analysis)
         top_jobs = cost_analysis.get("top_jobs", [])
         if top_jobs:
+            # Get detailed job metrics from job_analysis
+            jobs_detail = {str(j.get('job_id')): j for j in job_analysis.get('jobs', [])}
+            
             lines.extend([
                 "",
                 "## Top Cost Drivers - Jobs",
                 "",
-                "| Job ID | Name | DBUs | Cost |",
-                "|--------|------|------|------|",
+                "| Job ID | Name | Runs | DBUs | Cost/Run | Total Cost |",
+                "|--------|------|------|------|----------|------------|",
             ])
             for job in top_jobs[:5]:
-                job_id = self._truncate_text(str(job.get('id', 'N/A')), 20)
+                job_id = str(job.get('id', 'N/A'))
                 job_name = job.get('name') or 'N/A'
-                lines.append(f"| {job_id} | {self._truncate_text(str(job_name), 60)} | {job.get('dbus', 0):,.2f} | ${job.get('cost', 0):,.2f} |")
+                
+                # Try to get run count and cost per run from detailed job data
+                detail = jobs_detail.get(job_id, {})
+                runs = detail.get('run_count', '-')
+                cost_per_run = detail.get('cost_per_run', 0)
+                
+                if runs != '-' and runs > 0:
+                    runs_str = str(runs)
+                    cost_per_run_str = f"${cost_per_run:.3f}"
+                else:
+                    runs_str = '-'
+                    cost_per_run_str = '-'
+                
+                lines.append(f"| {self._truncate_text(job_id, 20)} | {self._truncate_text(str(job_name), 50)} | {runs_str} | {job.get('dbus', 0):,.2f} | {cost_per_run_str} | ${job.get('cost', 0):,.2f} |")
         
         # Top cost drivers - SQL Warehouses
         top_warehouses = cost_analysis.get("top_warehouses", [])
@@ -614,6 +791,31 @@ class MarkdownReport:
                 lines.append("> ⚠️ Verify these are actively being used. Stop idle warehouses to save costs.")
                 lines.append("")
             
+            # Idle warehouses (running but no queries)
+            idle_warehouses = warehouses_data.get("idle_warehouses", [])
+            if idle_warehouses:
+                lines.extend([
+                    "### 💤 Idle Warehouses (No Query Activity!)",
+                    "",
+                    "These warehouses are running but have **NO recent query activity** - pure waste:",
+                    "",
+                    "| Name | Size | Running Hours | Recent Queries | Last Query |",
+                    "|------|------|---------------|----------------|------------|",
+                ])
+                for wh in idle_warehouses[:10]:
+                    name = self._truncate_text(wh.get("warehouse_name", "Unknown"), 50)
+                    size = wh.get("warehouse_size", "N/A")
+                    hours = wh.get("running_hours", 0)
+                    query_count = wh.get("recent_query_count", 0)
+                    last_query = wh.get("last_query_time", "Never")
+                    if last_query and last_query != "Never":
+                        # Truncate timestamp if too long
+                        last_query = str(last_query)[:19]
+                    lines.append(f"| {name} | {size} | 🔴 {hours:.1f}h | {query_count} | {last_query} |")
+                lines.append("")
+                lines.append("> 🚨 **STOP THESE NOW!** These are burning money with zero productivity.")
+                lines.append("")
+            
             # Upscaled warehouses
             upscaled = warehouses_data.get("upscaled_warehouses", [])
             if upscaled:
@@ -632,6 +834,29 @@ class MarkdownReport:
                     hours = wh.get("upscaled_hours", 0)
                     lines.append(f"| {name} | {current} | {max_c} | {hours:.1f}h |")
                 lines.append("")
+        
+        lines.extend([
+            "",
+            "## ✅ Quick Wins Checklist",
+            "",
+            "Copy this to Jira/GitHub/your task tracker. Check off items as you complete them:",
+            "",
+        ])
+        
+        # Generate checklist from high-severity recommendations
+        quick_wins_for_checklist = [r for r in recommendations if r.get('severity', '').upper() == 'HIGH']
+        if quick_wins_for_checklist:
+            for i, rec in enumerate(quick_wins_for_checklist, 1):
+                title = rec.get('title', '').replace('🚨 ', '').replace('💰 ', '').replace('🔧 ', '').replace('⚡ ', '')
+                savings = rec.get('estimated_savings', 0)
+                effort = rec.get('effort', 'Unknown')
+                lines.append(f"- [ ] **{title}** (Saves ${savings:,.0f}/month, {effort})")
+        else:
+            lines.append("- [ ] No high-priority quick wins identified - excellent cost management!")
+        
+        lines.append("")
+        lines.append("> 💡 **Pro tip**: Assign each item to an owner and set due dates. Most of these can be completed in under 30 minutes.")
+        lines.append("")
         
         lines.extend([
             "",
@@ -894,15 +1119,16 @@ class MarkdownReport:
                 "",
                 "Queries moving large amounts of data between nodes (optimization candidates):",
                 "",
-                "| User | Shuffle | Duration | Preview |",
-                "|------|---------|----------|---------|",
+                "| Query ID | User | Shuffle | Duration | Preview |",
+                "|----------|------|---------|----------|---------|",
             ])
             for q in shuffle_queries[:5]:
+                query_id = self._truncate_text(q.get("statement_id", "N/A"), 30)
                 user = self._truncate_text((q.get("user") or "N/A").split("@")[0], 20)
                 shuffle_gb = q.get("shuffle_gb", 0)
                 dur = q.get("duration_seconds", 0)
-                preview = self._truncate_text((q.get("statement_preview") or "").replace("|", "/"), 80)
-                lines.append(f"| {user} | {shuffle_gb:.1f}GB | {dur:.0f}s | {preview}... |")
+                preview = self._truncate_text((q.get("statement_preview") or "").replace("|", "/"), 60)
+                lines.append(f"| `{query_id}` | {user} | {shuffle_gb:.1f}GB | {dur:.0f}s | {preview} |")
             lines.append("")
         
         lines.append("### Common Issues")
@@ -938,14 +1164,57 @@ class MarkdownReport:
         for i, rec in enumerate(recommendations, 1):
             rec_savings = rec.get('estimated_savings', 0)
             rec_savings_annual = rec_savings * 12
+            rec_effort = rec.get('effort', 'Unknown')
+            rec_category = rec.get('category', 'general')
+            rec_resource_id = rec.get('resource_id', '')
+            rec_contact = rec.get('contact', '')
+            
+            # Calculate effort-to-savings ratio
+            effort_minutes = self._effort_to_minutes(rec_effort)
+            roi_per_minute = (rec_savings / effort_minutes) if effort_minutes > 0 else 0
+            
             lines.extend([
                 f"### {i}. {rec['title']}",
                 "",
-                f"**Severity**: {rec['severity'].upper()} | **Category**: {rec.get('category', 'general').upper()} | **Est. Savings**: ${rec_savings:,.2f}/month",
-                "",
-                f"{rec['description']}",
+                f"**Severity**: {rec['severity'].upper()} | **Category**: {rec_category.upper()} | **Est. Savings**: ${rec_savings:,.2f}/month (${rec_savings_annual:,.0f}/year)",
                 "",
             ])
+            
+            # Add resource link if available
+            if rec_resource_id and self.workspace_url:
+                resource_url = self._generate_resource_url(rec_category, rec_resource_id)
+                if resource_url:
+                    lines.append(f"🔗 **Direct Link**: [{rec_category.title()} Configuration]({resource_url})")
+                    lines.append("")
+            
+            # Add contact info if available
+            if rec_contact:
+                lines.append(f"👤 **Contact**: {rec_contact}")
+                lines.append("")
+            
+            # Add effort and ROI metrics
+            lines.append(f"⏱️ **Effort**: {rec_effort} | **ROI**: ${roi_per_minute:.2f}/minute of work")
+            lines.append("")
+            
+            lines.append(f"{rec['description']}")
+            lines.append("")
+            
+            # Add before/after config if present
+            before_config = rec.get('before_config')
+            after_config = rec.get('after_config')
+            if before_config and after_config:
+                lines.extend([
+                    "**Configuration Change:**",
+                    "",
+                    "```yaml",
+                    "# Before:",
+                    before_config,
+                    "",
+                    "# After:",
+                    after_config,
+                    "```",
+                    "",
+                ])
             
             # Add insight if present (data-driven context)
             insight = rec.get('insight')
@@ -959,8 +1228,16 @@ class MarkdownReport:
                 "**Action Steps**:",
                 "",
             ])
+            
+            # Format steps with proper indentation for sub-bullets
             for j, step in enumerate(rec.get('steps', []), 1):
-                lines.append(f"{j}. {step}")
+                # Detect if step starts with common sub-bullet indicators
+                step_str = str(step).strip()
+                if step_str.startswith(('-', '*', '•')) or step_str.lower().startswith(('or:', 'option', 'alternative')):
+                    lines.append(f"   - {step_str.lstrip('-*• ')}")
+                else:
+                    lines.append(f"{j}. {step}")
+            
             lines.extend(["", "---", ""])
         
         lines.extend([
