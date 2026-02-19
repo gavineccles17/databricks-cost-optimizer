@@ -48,6 +48,13 @@ class MarkdownReport:
         else:
             return f"{annual_savings:,.0f}/year (meaningful cost reduction)"
     
+    def _truncate_text(self, text: str, max_length: int) -> str:
+        """Truncate text with ellipsis if too long."""
+        if not text or len(text) <= max_length:
+            return text
+        # Leave room for ellipsis
+        return text[:max_length-3] + "..."
+    
     def _benchmark_assessment(self, waste_percentage: float) -> str:
         """Assess how the company's waste compares to industry benchmark."""
         if waste_percentage >= 35:
@@ -192,14 +199,14 @@ class MarkdownReport:
             ])
             
             for m in worker_metrics:
-                name = m.get("cluster_name", m.get("cluster_id", "unknown"))[:25]
+                name = self._truncate_text(m.get("cluster_name", m.get("cluster_id", "unknown")), 50)
                 dbus = m.get("total_dbus", 0)
                 cpu_p50 = m.get("cpu_p50", 0)
                 cpu_p90 = m.get("cpu_p90", 0)
                 mem_p50 = m.get("mem_p50", 0)
                 mem_p95 = m.get("mem_p95", 0)
                 status = m.get("overall_status", "unknown")
-                action = m.get("suggested_action", "")[:40]
+                action = self._truncate_text(m.get("suggested_action", ""), 80)
                 
                 # Status emoji
                 if status == "over-provisioned":
@@ -233,7 +240,7 @@ class MarkdownReport:
                 "|---------|---------|-------------|---------------|",
             ])
             for c in idle_clusters[:10]:
-                name = c.get("cluster_name", "unknown")[:30]
+                name = self._truncate_text(c.get("cluster_name", "unknown"), 60)
                 avg_cpu = c.get("avg_cpu_percent", 0)
                 pct_idle = c.get("pct_time_idle", 0)
                 dbus = c.get("total_dbus", 0)
@@ -257,7 +264,7 @@ class MarkdownReport:
                 "|---------|-----|-----|-------------|-------|",
             ])
             for c in never_down[:5]:
-                name = c.get("cluster_name", "unknown")[:25]
+                name = self._truncate_text(c.get("cluster_name", "unknown"), 50)
                 min_w = c.get("autoscale_min", 0)
                 max_w = c.get("autoscale_max", 0)
                 avg_w = c.get("avg_workers", 0)
@@ -280,7 +287,7 @@ class MarkdownReport:
                 "|---------|------------|------------|------------|------------|-------|",
             ])
             for c in imbalanced[:5]:
-                name = c.get("cluster_name", "unknown")[:20]
+                name = self._truncate_text(c.get("cluster_name", "unknown"), 40)
                 d_cpu = c.get("driver_cpu_p90", 0)
                 w_cpu = c.get("worker_cpu_p90", 0)
                 d_mem = c.get("driver_mem_p95", 0)
@@ -490,7 +497,7 @@ class MarkdownReport:
                 user_dbus = user.get("dbus", 0)
                 user_cost = user.get("cost", 0)
                 user_pct = (user_cost / total_cost * 100) if total_cost > 0 else 0
-                lines.append(f"| {user_id[:40]} | {user_dbus:,.2f} | ${user_cost:,.2f} | {user_pct:.1f}% |")
+                lines.append(f"| {self._truncate_text(user_id, 60)} | {user_dbus:,.2f} | ${user_cost:,.2f} | {user_pct:.1f}% |")
         
         if unattributed_cost > 0.01:
             lines.append(f"| *(System/Unattributed)* | - | ${unattributed_cost:,.2f} | {unattributed_cost/total_cost*100:.1f}% |")
@@ -508,9 +515,9 @@ class MarkdownReport:
                 "|---------|------|------|------|",
             ])
             for cluster in top_clusters[:5]:
-                cluster_id = cluster.get('id', 'N/A')[:20]
+                cluster_id = self._truncate_text(cluster.get('id', 'N/A'), 30)
                 cluster_name = cluster.get('name') or 'N/A'
-                lines.append(f"| {cluster_id} | {str(cluster_name)[:25]} | {cluster.get('dbus', 0):,.2f} | ${cluster.get('cost', 0):,.2f} |")
+                lines.append(f"| {cluster_id} | {self._truncate_text(str(cluster_name), 50)} | {cluster.get('dbus', 0):,.2f} | ${cluster.get('cost', 0):,.2f} |")
         
         # Top cost drivers - Jobs
         top_jobs = cost_analysis.get("top_jobs", [])
@@ -523,9 +530,9 @@ class MarkdownReport:
                 "|--------|------|------|------|",
             ])
             for job in top_jobs[:5]:
-                job_id = str(job.get('id', 'N/A'))[:15]
+                job_id = self._truncate_text(str(job.get('id', 'N/A')), 20)
                 job_name = job.get('name') or 'N/A'
-                lines.append(f"| {job_id} | {str(job_name)[:30]} | {job.get('dbus', 0):,.2f} | ${job.get('cost', 0):,.2f} |")
+                lines.append(f"| {job_id} | {self._truncate_text(str(job_name), 60)} | {job.get('dbus', 0):,.2f} | ${job.get('cost', 0):,.2f} |")
         
         # Top cost drivers - SQL Warehouses
         top_warehouses = cost_analysis.get("top_warehouses", [])
@@ -538,9 +545,9 @@ class MarkdownReport:
                 "|--------------|------|------|------|",
             ])
             for wh in top_warehouses[:5]:
-                wh_id = wh.get('id', 'N/A')[:20]
+                wh_id = self._truncate_text(wh.get('id', 'N/A'), 30)
                 wh_name = wh.get('name') or 'N/A'
-                lines.append(f"| {wh_id} | {str(wh_name)[:25]} | {wh.get('dbus', 0):,.2f} | ${wh.get('cost', 0):,.2f} |")
+                lines.append(f"| {wh_id} | {self._truncate_text(str(wh_name), 50)} | {wh.get('dbus', 0):,.2f} | ${wh.get('cost', 0):,.2f} |")
         
         # Detailed Warehouse Analysis
         warehouses = warehouses_data.get("warehouses", [])
@@ -560,7 +567,7 @@ class MarkdownReport:
                 "|------|------|------|-----------|-------|-------------|",
             ])
             for wh in warehouses:
-                name = wh.get("warehouse_name", "N/A")[:25]
+                name = self._truncate_text(wh.get("warehouse_name", "N/A"), 50)
                 size = wh.get("warehouse_size", "N/A")
                 wh_type_raw = str(wh.get("warehouse_type", "")).upper()
                 wh_type = "Serverless" if "SERVERLESS" in wh_type_raw else "Classic"
@@ -597,7 +604,7 @@ class MarkdownReport:
                     "|------|------|---------------|----------|",
                 ])
                 for wh in long_running[:10]:
-                    name = wh.get("warehouse_name", "Unknown")[:25]
+                    name = self._truncate_text(wh.get("warehouse_name", "Unknown"), 50)
                     size = wh.get("warehouse_size", "N/A")
                     hours = wh.get("running_hours", 0)
                     clusters = wh.get("cluster_count", 1)
@@ -619,7 +626,7 @@ class MarkdownReport:
                     "|------|----------|-----|----------------|",
                 ])
                 for wh in upscaled[:5]:
-                    name = wh.get("warehouse_name", "Unknown")[:25]
+                    name = self._truncate_text(wh.get("warehouse_name", "Unknown"), 50)
                     current = wh.get("current_clusters", 2)
                     max_c = wh.get("max_clusters", current)
                     hours = wh.get("upscaled_hours", 0)
@@ -684,7 +691,7 @@ class MarkdownReport:
             for cc in cluster_costs[:10]:
                 name = cc.get("cluster_name") or cc.get("cluster_id", "N/A")
                 owner = cc.get("owner", "N/A") or "N/A"
-                lines.append(f"| {str(name)[:25]} | {str(owner)[:20]} | {cc.get('total_dbus', 0):,.2f} | ${cc.get('total_cost', 0):,.2f} |")
+                lines.append(f"| {self._truncate_text(str(name), 50)} | {self._truncate_text(str(owner), 40)} | {cc.get('total_dbus', 0):,.2f} | ${cc.get('total_cost', 0):,.2f} |")
         
         lines.extend([
             "",
@@ -719,7 +726,7 @@ class MarkdownReport:
             ])
             for job in jobs[:10]:
                 name = job.get("job_name") or job.get("job_id", "N/A")
-                name_str = str(name)[:25]
+                name_str = self._truncate_text(str(name), 50)
                 run_count = job.get("run_count", 0)
                 avg_duration = job.get("avg_duration_seconds", 0)
                 if avg_duration >= 60:
@@ -742,7 +749,7 @@ class MarkdownReport:
             ])
             for issue in efficiency_issues[:10]:
                 severity = issue.get("severity", "medium").upper()
-                job_name = issue.get("job_name", "Unknown")[:30]
+                job_name = self._truncate_text(issue.get("job_name", "Unknown"), 60)
                 desc = issue.get("description", "")
                 lines.append(f"- **[{severity}]** {job_name}: {desc}")
             lines.append("")
@@ -758,7 +765,7 @@ class MarkdownReport:
                 "|----------|--------------|-------------|-----------|",
             ])
             for job in high_failure_jobs[:5]:
-                name = str(job.get("job_name", "Unknown"))[:25]
+                name = self._truncate_text(str(job.get("job_name", "Unknown")), 50)
                 lines.append(f"| {name} | {job.get('failure_rate', 0):.1f}% | ${job.get('wasted_cost', 0):,.2f} | {job.get('run_count', 0)} |")
             lines.append("")
         
@@ -775,7 +782,7 @@ class MarkdownReport:
                 "|----------|--------------|----------|------------|",
             ])
             for job in short_run_jobs[:5]:
-                name = str(job.get("job_name", "Unknown"))[:25]
+                name = self._truncate_text(str(job.get("job_name", "Unknown")), 50)
                 avg_dur = job.get("avg_duration_seconds", 0)
                 dur_str = f"{avg_dur:.0f}s" if avg_dur < 60 else f"{avg_dur/60:.1f}m"
                 lines.append(f"| {name} | {dur_str} | ${job.get('cost_per_run', 0):.3f} | ${job.get('total_cost', 0):,.2f} |")
@@ -807,8 +814,8 @@ class MarkdownReport:
             ])
             for q in expensive_queries[:5]:
                 query_id = q.get("statement_id", "N/A")
-                # Show first 20 chars of query ID (they're long UUIDs)
-                query_id_short = query_id[:20] + "..." if len(query_id) > 20 else query_id
+                # Truncate query ID (they're long UUIDs)
+                query_id_short = self._truncate_text(query_id, 30)
                 
                 duration = q.get("duration_seconds", 0)
                 if duration >= 60:
@@ -828,7 +835,7 @@ class MarkdownReport:
                 else:
                     rows_str = f"{int(rows_read)}"
                 
-                user = (q.get("user") or "N/A").split("@")[0][:15]  # Just username part
+                user = self._truncate_text((q.get("user") or "N/A").split("@")[0], 25)  # Just username part
                 lines.append(f"| `{query_id_short}` | {dur_str} | {stmt_type} | {rows_str} | {user} |")
             lines.append("")
         
@@ -842,7 +849,7 @@ class MarkdownReport:
                 "|------|-------------|--------------|----------------|",
             ])
             for u in user_stats[:10]:
-                user = u.get("user", "N/A")[:25]
+                user = self._truncate_text(u.get("user", "N/A"), 50)
                 count = u.get("query_count", 0)
                 avg_dur = u.get("avg_duration_seconds", 0)
                 total_dur = u.get("total_duration_seconds", 0)
@@ -871,7 +878,7 @@ class MarkdownReport:
                 "|--------------|-----------------|-----------|---------------|",
             ])
             for wh in warehouses_with_spill[:5]:
-                wh_id = (wh.get("warehouse_id") or "unknown")[:15]
+                wh_id = self._truncate_text(wh.get("warehouse_id") or "unknown", 30)
                 freq = wh.get("spill_frequency", 0)
                 max_gb = wh.get("max_spilled_gb", 0)
                 needs = "⚠️ Yes" if wh.get("needs_upsize") else "No"
@@ -891,10 +898,10 @@ class MarkdownReport:
                 "|------|---------|----------|---------|",
             ])
             for q in shuffle_queries[:5]:
-                user = (q.get("user") or "N/A").split("@")[0][:12]
+                user = self._truncate_text((q.get("user") or "N/A").split("@")[0], 20)
                 shuffle_gb = q.get("shuffle_gb", 0)
                 dur = q.get("duration_seconds", 0)
-                preview = (q.get("statement_preview") or "")[:40].replace("|", "/")
+                preview = self._truncate_text((q.get("statement_preview") or "").replace("|", "/"), 80)
                 lines.append(f"| {user} | {shuffle_gb:.1f}GB | {dur:.0f}s | {preview}... |")
             lines.append("")
         
