@@ -62,11 +62,11 @@ class MarkdownReport:
         return text[:max_length-3] + "..."
     
     def _calculate_savings_grade(self, savings_percentage: float) -> str:
-        \"\"\"Calculate savings score grade (A-F).
+        """Calculate savings score grade (A-F).
         
         Based on percentage of current cost that can be saved.
         Higher percentage = worse current efficiency but more opportunity.
-        \"\"\"
+        """
         if savings_percentage >= 40:
             return "F"  # Very poor efficiency
         elif savings_percentage >= 30:
@@ -79,7 +79,7 @@ class MarkdownReport:
             return "A"  # Excellent efficiency
     
     def _effort_to_minutes(self, effort_str: str) -> float:
-        \"\"\"Convert effort string to minutes for ratio calculation.\"\"\"
+        """Convert effort string to minutes for ratio calculation."""
         effort_str = str(effort_str).lower()
         if "second" in effort_str:
             # Extract number before 'second'
@@ -112,18 +112,18 @@ class MarkdownReport:
         return 30  # Default 30 minutes
     
     def _generate_resource_url(self, resource_type: str, resource_id: str) -> str:
-        \"\"\"Generate direct Databricks URL for a resource.\"\"\"
+        """Generate direct Databricks URL for a resource."""
         if not self.workspace_url or not resource_id:
-            return \"\"
+            return ""
         
         url_templates = {
-            \"cluster\": f\"{self.workspace_url}/#setting/clusters/{resource_id}\",
-            \"job\": f\"{self.workspace_url}/#job/{resource_id}\",
-            \"warehouse\": f\"{self.workspace_url}/sql/warehouses/{resource_id}\",
-            \"query\": f\"{self.workspace_url}/sql/editor/{resource_id}\",
+            "cluster": f"{self.workspace_url}/#setting/clusters/{resource_id}",
+            "job": f"{self.workspace_url}/#job/{resource_id}",
+            "warehouse": f"{self.workspace_url}/sql/warehouses/{resource_id}",
+            "query": f"{self.workspace_url}/sql/editor/{resource_id}",
         }
         
-        return url_templates.get(resource_type, \"\")
+        return url_templates.get(resource_type, "")
     
     def _benchmark_assessment(self, waste_percentage: float) -> str:
         """Assess how the company's waste compares to industry benchmark."""
@@ -539,7 +539,7 @@ class MarkdownReport:
             f"- **Cost Efficiency Grade**: **{savings_grade}** ({savings_percentage:.1f}% optimization potential)",
             f"- **Optimization Opportunities**: {len(recommendations)}",
             f"- **Savings Potential**: {savings_percentage:.1f}% of current spend",
-        ]
+        ])
         
         if savings_capped:
             lines.append(f"- **Note**: Actual recommended savings exceed monthly cost; capped at 95% for realistic projections")
@@ -556,7 +556,7 @@ class MarkdownReport:
             "",
             f"📊 **Annual Impact**: ${annual_savings:,.2f}/year = {self._estimate_business_impact(annual_savings)}",
             "",
-        ]
+        ])
         
         # Governance Insights section
         lines.extend(self._build_governance_section(usage_data, monthly_cost))
