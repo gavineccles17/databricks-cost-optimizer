@@ -429,12 +429,12 @@ class WarehouseCollector:
             ),
             query_activity AS (
                 SELECT
-                    warehouse_id,
+                    compute.warehouse_id as warehouse_id,
                     COUNT(*) as query_count,
                     MAX(end_time) as last_query_time
                 FROM system.query.history
                 WHERE start_time >= CURRENT_DATE() - INTERVAL 1 DAY
-                GROUP BY warehouse_id
+                GROUP BY compute.warehouse_id
             )
             SELECT
                 rw.warehouse_id,
