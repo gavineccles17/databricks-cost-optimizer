@@ -163,25 +163,6 @@ class JobCollector:
             ORDER BY total_cost DESC
             LIMIT 100
             """
-                usage.usage_metadata.job_name as job_name,
-                NULL as owner,
-                usage.sku_name,
-                usage.product_features.is_serverless as is_serverless,
-                SUM(usage.usage_quantity) as total_dbus,
-                SUM(usage.usage_quantity * lp.pricing.effective_list.default) as total_cost,
-                COUNT(DISTINCT usage.usage_metadata.job_run_id) as run_count,
-                MIN(usage.usage_start_time) as first_run,
-                MAX(usage.usage_end_time) as last_run
-            FROM system.billing.usage usage
-            JOIN system.billing.list_prices lp ON lp.sku_name = usage.sku_name
-            WHERE usage.usage_metadata.job_id IS NOT NULL
-                AND usage.usage_end_time >= lp.price_start_time
-                AND (lp.price_end_time IS NULL OR usage.usage_end_time < lp.price_end_time)
-                AND usage.usage_date BETWEEN '{start_date.date()}' AND '{end_date.date()}'
-            GROUP BY 1, 2, 3, 4, 5
-            ORDER BY total_cost DESC
-            LIMIT 100
-            """
             job_costs = self.client.execute_query(fallback_query)
             logger.info(f"Fallback job query returned {len(job_costs)} jobs")
             return job_costs
